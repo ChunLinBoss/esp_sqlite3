@@ -1,0 +1,21 @@
+version: "0.1.0"
+description: "SQLite 3.54.1 for ESP-IDF: VFS, WAL, PSRAM, FTS5, RTREE, backup and migration"
+url: "https://github.com/chunlin/esp_sqlite3"
+repository: "https://github.com/chunlin/esp_sqlite3.git"
+documentation: "https://github.com/chunlin/esp_sqlite3/blob/main/docs/README.md"
+issues: "https://github.com/chunlin/esp_sqlite3/issues"
+license: "MIT"
+
+tags:
+  - sqlite
+  - database
+  - storage
+  - sql
+  - filesystem
+  - wal
+
+targets:
+  - esp32c5
+
+dependencies:
+  idf: ">=5.5"
