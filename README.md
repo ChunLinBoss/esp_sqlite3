@@ -13,14 +13,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlin/esp_sqlite3^0.1.0"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.1.0"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlin/esp_sqlite3: "^0.1.0"
+  chunlinboss/esp_sqlite3: "^0.1.0"
 ```
 
 ## 为什么重做
