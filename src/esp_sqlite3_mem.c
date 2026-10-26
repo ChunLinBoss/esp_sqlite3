@@ -41,24 +41,37 @@ static bool s_psram_available = false;
  * 分配实现
  * ------------------------------------------------------------------------- */
 
-static void *esp_sqlite3_malloc(int n)
-{
-    if (n <= 0) {
-        n = 1;
-    }
+/** SQLite 默认要求 8 字节对齐；ESP-IDF heap_caps_malloc 只保证 4 字节 */
+#define ESP_SQLITE3_MEM_ALIGN 8
 
+/** 分配一块 8 字节对齐的内存，优先 PSRAM，失败回退内部 RAM */
+static void *esp_sqlite3_alloc_aligned(size_t n, bool prefer_psram)
+{
 #if ESP_SQLITE3_USE_PSRAM
-    /* 大对象优先放 PSRAM：页缓存/排序/WAL 索引通常是几十 KB 到几 MB */
-    if (s_psram_available && n >= ESP_SQLITE3_PSRAM_THRESHOLD) {
-        void *p = heap_caps_malloc((size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (prefer_psram && s_psram_available) {
+        void *p = heap_caps_aligned_alloc(ESP_SQLITE3_MEM_ALIGN, n,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (p != NULL) {
             return p;
         }
-        /* PSRAM 不足时回退内部 RAM，而不是直接失败 */
     }
+#else
+    (void)prefer_psram;
 #endif
 
-    return heap_caps_malloc((size_t)n, MALLOC_CAP_8BIT);
+    void *p = heap_caps_aligned_alloc(ESP_SQLITE3_MEM_ALIGN, n,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        /* 部分配置下没有单独的内部 heap 标记，最后再放宽一次 */
+        p = heap_caps_aligned_alloc(ESP_SQLITE3_MEM_ALIGN, n, MALLOC_CAP_8BIT);
+    }
+    return p;
+}
+
+static void *esp_sqlite3_malloc(int n)
+{
+    size_t size = (n > 0) ? (size_t)n : 1;
+    return esp_sqlite3_alloc_aligned(size, size >= ESP_SQLITE3_PSRAM_THRESHOLD);
 }
 
 static void esp_sqlite3_free(void *p)
@@ -78,17 +91,15 @@ static void *esp_sqlite3_realloc(void *p, int n)
         return NULL;
     }
 
-#if ESP_SQLITE3_USE_PSRAM
-    if (s_psram_available && n >= ESP_SQLITE3_PSRAM_THRESHOLD) {
-        void *q = heap_caps_realloc(p, (size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (q != NULL) {
-            return q;
-        }
-        /* 回退：继续尝试内部 RAM */
+    size_t old_size = heap_caps_get_allocated_size(p);
+    void *q = esp_sqlite3_malloc(n);
+    if (q == NULL) {
+        return NULL;
     }
-#endif
-
-    return heap_caps_realloc(p, (size_t)n, MALLOC_CAP_8BIT);
+    size_t copy_size = (old_size < (size_t)n) ? old_size : (size_t)n;
+    memcpy(q, p, copy_size);
+    esp_sqlite3_free(p);
+    return q;
 }
 
 /**

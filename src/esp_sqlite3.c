@@ -14,10 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #include "sqlite3.h"
@@ -36,7 +38,56 @@ struct esp_sqlite3 {
     bool read_only;     /**< 是否只读打开 */
 };
 
-static bool s_initialized = false;
+typedef enum {
+    ESP_SQLITE3_STATE_UNINIT = 0,
+    ESP_SQLITE3_STATE_INITIALIZING,
+    ESP_SQLITE3_STATE_READY,
+} esp_sqlite3_state_t;
+
+static volatile esp_sqlite3_state_t s_state = ESP_SQLITE3_STATE_UNINIT;
+static int s_open_connections = 0;
+static SemaphoreHandle_t s_state_mutex = NULL;
+static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t esp_sqlite3_state_mutex_get(void)
+{
+    if (s_state_mutex == NULL) {
+        portENTER_CRITICAL(&s_state_mux);
+        if (s_state_mutex == NULL) {
+            s_state_mutex = xSemaphoreCreateRecursiveMutex();
+        }
+        portEXIT_CRITICAL(&s_state_mux);
+    }
+    return s_state_mutex;
+}
+
+static esp_err_t esp_sqlite3_connection_begin(void)
+{
+    SemaphoreHandle_t lock = esp_sqlite3_state_mutex_get();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTakeRecursive(lock, portMAX_DELAY);
+    esp_err_t err = esp_sqlite3_init();
+    if (err == ESP_OK) {
+        s_open_connections++;
+    }
+    xSemaphoreGiveRecursive(lock);
+    return err;
+}
+
+static void esp_sqlite3_connection_end(void)
+{
+    SemaphoreHandle_t lock = esp_sqlite3_state_mutex_get();
+    if (lock == NULL) {
+        return;
+    }
+    xSemaphoreTakeRecursive(lock, portMAX_DELAY);
+    if (s_open_connections > 0) {
+        s_open_connections--;
+    }
+    xSemaphoreGiveRecursive(lock);
+}
 
 /* -------------------------------------------------------------------------
  * 工具函数
@@ -83,6 +134,75 @@ static esp_err_t esp_sqlite3_apply_pragma_required(sqlite3 *db, const char *sql)
     return ESP_OK;
 }
 
+/** 查询单行单列 PRAGMA 文本结果 */
+static esp_err_t esp_sqlite3_pragma_text(sqlite3 *db, const char *sql,
+                                        char *out, size_t out_len)
+{
+    if (db == NULL || sql == NULL || out == NULL || out_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        esp_sqlite3_log_error(db, rc, sql);
+        return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        if (text != NULL) {
+            snprintf(out, out_len, "%s", (const char *)text);
+        }
+    } else if (rc != SQLITE_DONE) {
+        esp_sqlite3_log_error(db, rc, sql);
+        sqlite3_finalize(stmt);
+        return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    sqlite3_finalize(stmt);
+    return out[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+/** 查询单行单列 PRAGMA 整数结果 */
+static esp_err_t esp_sqlite3_pragma_int(sqlite3 *db, const char *sql, int64_t *out)
+{
+    if (db == NULL || sql == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        esp_sqlite3_log_error(db, rc, sql);
+        return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        *out = sqlite3_column_int64(stmt, 0);
+    } else {
+        esp_sqlite3_log_error(db, rc, sql);
+        sqlite3_finalize(stmt);
+        return rc == SQLITE_DONE ? ESP_ERR_NOT_FOUND : esp_sqlite3_rc_to_esp_err(rc);
+    }
+    sqlite3_finalize(stmt);
+    return ESP_OK;
+}
+
+/** 打开失败时释放 wrapper，并撤销连接计数 */
+static void esp_sqlite3_abort_open(esp_sqlite3_t *wrapper)
+{
+    if (wrapper == NULL) {
+        return;
+    }
+    if (wrapper->db != NULL) {
+        (void)sqlite3_close(wrapper->db);
+        wrapper->db = NULL;
+    }
+    esp_sqlite3_connection_end();
+    free(wrapper->path);
+    free(wrapper);
+}
+
 /** 内部：把 SQLite 错误写入日志 */
 void esp_sqlite3_log_error(sqlite3 *db, int rc, const char *what)
 {
@@ -123,18 +243,37 @@ static void esp_sqlite3_log_cb(void *arg, int code, const char *msg)
 
 esp_err_t esp_sqlite3_init(void)
 {
-    if (s_initialized) {
+    SemaphoreHandle_t lock = esp_sqlite3_state_mutex_get();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    xSemaphoreTakeRecursive(lock, portMAX_DELAY);
+
+    if (s_state == ESP_SQLITE3_STATE_READY) {
+        xSemaphoreGiveRecursive(lock);
         return ESP_OK;
     }
+    if (s_state == ESP_SQLITE3_STATE_INITIALIZING) {
+        /* 同一任务递归调用 init；不允许在初始化途中再次配置 SQLite */
+        xSemaphoreGiveRecursive(lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_state = ESP_SQLITE3_STATE_INITIALIZING;
 
     /* 顺序非常重要：MALLOC/MUTEX/LOG 都必须在 sqlite3_initialize() 之前配置 */
     esp_err_t err = esp_sqlite3_mem_register();
     if (err != ESP_OK) {
+        s_state = ESP_SQLITE3_STATE_UNINIT;
+        xSemaphoreGiveRecursive(lock);
         return err;
     }
 
     err = esp_sqlite3_mutex_register();
     if (err != ESP_OK) {
+        s_state = ESP_SQLITE3_STATE_UNINIT;
+        xSemaphoreGiveRecursive(lock);
         return err;
     }
     int rc = sqlite3_config(SQLITE_CONFIG_LOG, esp_sqlite3_log_cb, NULL);
@@ -142,11 +281,23 @@ esp_err_t esp_sqlite3_init(void)
         ESP_SQLITE3_LOGW("sqlite3_config(LOG) failed: rc=%d", rc);
     }
 
-    /* SQLITE_OS_OTHER=1 时，sqlite3_initialize() 会回调 sqlite3_os_init() 注册 VFS */
+    /* SQLITE_OS_OTHER=1 时，sqlite3_initialize() 会回调 sqlite3_os_init()；
+     * VFS 在 initialize 完成后注册，避免 sqlite3_vfs_register() 递归初始化。 */
     rc = sqlite3_initialize();
     if (rc != SQLITE_OK) {
         ESP_SQLITE3_LOGE("sqlite3_initialize failed: rc=%d (%s)", rc, sqlite3_errstr(rc));
+        s_state = ESP_SQLITE3_STATE_UNINIT;
+        xSemaphoreGiveRecursive(lock);
         return ESP_FAIL;
+    }
+
+    err = esp_sqlite3_vfs_register(true);
+    if (err != ESP_OK) {
+        ESP_SQLITE3_LOGE("register VFS failed: %s", esp_err_to_name(err));
+        (void)sqlite3_shutdown();
+        s_state = ESP_SQLITE3_STATE_UNINIT;
+        xSemaphoreGiveRecursive(lock);
+        return err;
     }
 
     /* 临时文件目录（仅当编译为 temp_store=FILE 时需要） */
@@ -165,7 +316,7 @@ esp_err_t esp_sqlite3_init(void)
         /* 扩展失败不阻止核心数据库使用 */
     }
 
-    s_initialized = true;
+    s_state = ESP_SQLITE3_STATE_READY;
 #if defined(CONFIG_ESP_SQLITE3_TEMP_STORE_MEMORY) && CONFIG_ESP_SQLITE3_TEMP_STORE_MEMORY
     const char *temp_store_mode = "memory";
 #else
@@ -180,29 +331,50 @@ esp_err_t esp_sqlite3_init(void)
                     0
 #endif
     );
+    xSemaphoreGiveRecursive(lock);
     return ESP_OK;
 }
 
-void esp_sqlite3_deinit(void)
+esp_err_t esp_sqlite3_deinit(void)
 {
-    if (!s_initialized) {
-        return;
+    SemaphoreHandle_t lock = esp_sqlite3_state_mutex_get();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    xSemaphoreTakeRecursive(lock, portMAX_DELAY);
+    if (s_state != ESP_SQLITE3_STATE_READY) {
+        xSemaphoreGiveRecursive(lock);
+        return ESP_OK;
+    }
+    if (s_open_connections != 0) {
+        ESP_SQLITE3_LOGE("deinit refused: %d database connection(s) still open",
+                        s_open_connections);
+        xSemaphoreGiveRecursive(lock);
+        return ESP_ERR_INVALID_STATE;
     }
 
     esp_sqlite3_ext_unregister();
 
     int rc = sqlite3_shutdown();
     if (rc != SQLITE_OK) {
-        /* 仍有连接/语句未关闭：保持 initialized 状态，避免后续 open 崩溃 */
         ESP_SQLITE3_LOGW("sqlite3_shutdown failed: rc=%d (%s)", rc, sqlite3_errstr(rc));
-        return;
+        xSemaphoreGiveRecursive(lock);
+        return esp_sqlite3_rc_to_esp_err(rc);
     }
-    s_initialized = false;
+    s_state = ESP_SQLITE3_STATE_UNINIT;
+    xSemaphoreGiveRecursive(lock);
+    return ESP_OK;
 }
 
 bool esp_sqlite3_is_initialized(void)
 {
-    return s_initialized;
+    return s_state == ESP_SQLITE3_STATE_READY;
+}
+
+bool esp_sqlite3_is_initializing(void)
+{
+    return s_state == ESP_SQLITE3_STATE_INITIALIZING;
 }
 
 const char *esp_sqlite3_version(void)
@@ -217,7 +389,10 @@ void esp_sqlite3_set_log_level(int level)
 
 esp_err_t esp_sqlite3_ensure_init(void)
 {
-    return s_initialized ? ESP_OK : esp_sqlite3_init();
+    if (s_state == ESP_SQLITE3_STATE_READY) {
+        return ESP_OK;
+    }
+    return esp_sqlite3_init();
 }
 
 /* -------------------------------------------------------------------------
@@ -283,18 +458,33 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = esp_sqlite3_ensure_init();
+#ifdef SQLITE_OMIT_WAL
+    if (cfg->journal_mode == ESP_SQLITE3_JOURNAL_WAL) {
+        ESP_SQLITE3_LOGE("WAL is not compiled in this profile");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+#endif
+#ifdef SQLITE_OMIT_FOREIGN_KEY
+    if (cfg->foreign_keys) {
+        ESP_SQLITE3_LOGE("foreign keys are not compiled in this profile");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+#endif
+
+    esp_err_t err = esp_sqlite3_connection_begin();
     if (err != ESP_OK) {
         return err;
     }
 
     esp_sqlite3_t *wrapper = calloc(1, sizeof(*wrapper));
     if (wrapper == NULL) {
+        esp_sqlite3_connection_end();
         return ESP_ERR_NO_MEM;
     }
 
     wrapper->path = strdup(cfg->path);
     if (wrapper->path == NULL) {
+        esp_sqlite3_connection_end();
         free(wrapper);
         return ESP_ERR_NO_MEM;
     }
@@ -313,8 +503,9 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(wrapper->db, rc, "sqlite3_open_v2");
         if (wrapper->db != NULL) {
-            sqlite3_close_v2(wrapper->db);
+            (void)sqlite3_close(wrapper->db);
         }
+        esp_sqlite3_connection_end();
         free(wrapper->path);
         free(wrapper);
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -342,18 +533,59 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
         char sql[64];
         snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;",
                  esp_sqlite3_journal_mode_name(cfg->journal_mode));
-        esp_sqlite3_apply_pragma(wrapper->db, sql);
+        err = esp_sqlite3_apply_pragma_required(wrapper->db, sql);
+        if (err != ESP_OK) {
+            esp_sqlite3_abort_open(wrapper);
+            return err;
+        }
+
+        char actual[32] = {0};
+        err = esp_sqlite3_pragma_text(wrapper->db, "PRAGMA journal_mode;",
+                                      actual, sizeof(actual));
+        const char *wanted = esp_sqlite3_journal_mode_name(cfg->journal_mode);
+        if (err != ESP_OK || strcasecmp(actual, wanted) != 0) {
+            ESP_SQLITE3_LOGE("journal_mode not applied: wanted=%s actual=%s",
+                            wanted, actual);
+            esp_sqlite3_abort_open(wrapper);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
     }
 
     {
         char sql[64];
         snprintf(sql, sizeof(sql), "PRAGMA synchronous=%d;", (int)cfg->synchronous);
-        esp_sqlite3_apply_pragma(wrapper->db, sql);
+        err = esp_sqlite3_apply_pragma_required(wrapper->db, sql);
+        if (err != ESP_OK) {
+            esp_sqlite3_abort_open(wrapper);
+            return err;
+        }
+        int64_t actual_sync = -1;
+        if (esp_sqlite3_pragma_int(wrapper->db, "PRAGMA synchronous;", &actual_sync) == ESP_OK &&
+            actual_sync != (int64_t)cfg->synchronous) {
+            ESP_SQLITE3_LOGW("synchronous not applied: wanted=%d actual=%lld",
+                            (int)cfg->synchronous, (long long)actual_sync);
+        }
     }
 
-    esp_sqlite3_apply_pragma(wrapper->db, cfg->foreign_keys
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+    err = esp_sqlite3_apply_pragma_required(wrapper->db, cfg->foreign_keys
                     ? "PRAGMA foreign_keys=ON;"
                     : "PRAGMA foreign_keys=OFF;");
+    if (err != ESP_OK) {
+        esp_sqlite3_abort_open(wrapper);
+        return err;
+    }
+    {
+        int64_t actual_fk = -1;
+        if (esp_sqlite3_pragma_int(wrapper->db, "PRAGMA foreign_keys;", &actual_fk) == ESP_OK &&
+            actual_fk != (cfg->foreign_keys ? 1 : 0)) {
+            ESP_SQLITE3_LOGE("foreign_keys not applied: wanted=%d actual=%lld",
+                            cfg->foreign_keys ? 1 : 0, (long long)actual_fk);
+            esp_sqlite3_abort_open(wrapper);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+    }
+#endif
 
     esp_sqlite3_apply_pragma(wrapper->db, cfg->temp_store_memory
                     ? "PRAGMA temp_store=MEMORY;"
@@ -397,22 +629,25 @@ esp_err_t esp_sqlite3_open_simple(const char *path, esp_sqlite3_t **out_db)
     return esp_sqlite3_open(&cfg, out_db);
 }
 
-void esp_sqlite3_close(esp_sqlite3_t *db)
+esp_err_t esp_sqlite3_close(esp_sqlite3_t *db)
 {
     if (db == NULL) {
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
 
     if (db->db != NULL) {
-        int rc = sqlite3_close_v2(db->db);
+        int rc = sqlite3_close(db->db);
         if (rc != SQLITE_OK) {
-            esp_sqlite3_log_error(db->db, rc, "sqlite3_close_v2");
+            esp_sqlite3_log_error(db->db, rc, "sqlite3_close");
+            return esp_sqlite3_rc_to_esp_err(rc);
         }
         db->db = NULL;
+        esp_sqlite3_connection_end();
     }
 
     free(db->path);
     free(db);
+    return ESP_OK;
 }
 
 sqlite3 *esp_sqlite3_handle(esp_sqlite3_t *db)
@@ -912,12 +1147,24 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
     esp_sqlite3_config_init(&src_cfg);
     src_cfg.path = src_path;
     src_cfg.create = false;
+    /*
+     * 备份会同时打开源/目标两个连接。ESP32-C5 等无 PSRAM 的型号内部
+     * RAM 只有约 300KiB，默认 64KiB page cache 两个连接就可能 OOM。
+     * 备份是顺序读写，8KiB cache 足够，且能显著降低峰值内存。
+     */
+    src_cfg.cache_size_kib = 8;
+    src_cfg.temp_store_memory = false;
     esp_err_t err = esp_sqlite3_open(&src_cfg, &src);
     if (err != ESP_OK) {
         return err;
     }
 
-    err = esp_sqlite3_open_simple(dst_path, &dst);
+    esp_sqlite3_config_t dst_cfg;
+    esp_sqlite3_config_init(&dst_cfg);
+    dst_cfg.path = dst_path;
+    dst_cfg.cache_size_kib = 8;
+    dst_cfg.temp_store_memory = false;
+    err = esp_sqlite3_open(&dst_cfg, &dst);
     if (err != ESP_OK) {
         esp_sqlite3_close(src);
         return err;

@@ -115,9 +115,8 @@ endif()
 if(NOT CONFIG_ESP_SQLITE3_UTF16)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE SQLITE_OMIT_UTF16=1)
 endif()
-if(NOT CONFIG_ESP_SQLITE3_LOAD_EXTENSION)
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE SQLITE_OMIT_LOAD_EXTENSION=1)
-endif()
+# 动态加载扩展需要 xDlOpen；ESP-IDF 固件不支持通用动态库，始终移除。
+target_compile_definitions(${COMPONENT_LIB} PRIVATE SQLITE_OMIT_LOAD_EXTENSION=1)
 # 官方已废弃的 API 与共享缓存统一移除，不再提供 Kconfig 开关。
 # 被移除的接口清单见 docs/00-功能清单.md 的“已移除的废弃 API”章节。
 target_compile_definitions(${COMPONENT_LIB} PRIVATE

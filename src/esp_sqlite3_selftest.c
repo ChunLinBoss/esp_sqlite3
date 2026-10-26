@@ -84,6 +84,20 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
     }
 
     ESP_LOGI(TEST_TAG, "===== esp_sqlite3 selftest start =====");
+#if defined(CONFIG_ESP_SQLITE3_PROFILE_MAX)
+    const char *profile = "MAX";
+#elif defined(CONFIG_ESP_SQLITE3_PROFILE_FULL)
+    const char *profile = "FULL";
+#elif defined(CONFIG_ESP_SQLITE3_PROFILE_STANDARD)
+    const char *profile = "STANDARD";
+#elif defined(CONFIG_ESP_SQLITE3_PROFILE_MINIMAL)
+    const char *profile = "MINIMAL";
+#elif defined(CONFIG_ESP_SQLITE3_PROFILE_CRUD)
+    const char *profile = "CRUD";
+#else
+    const char *profile = "UNKNOWN";
+#endif
+    ESP_LOGI(TEST_TAG, "PROFILE=%s", profile);
     ESP_LOGI(TEST_TAG, "SQLite compile options: %s", sqlite3_compileoption_get(0) ? "yes" : "none");
 
     TEST_STEP(esp_sqlite3_init());
@@ -100,9 +114,13 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
     cfg.path = db_path;
     cfg.create = true;
     cfg.busy_timeout_ms = 5000;
-    cfg.cache_size_kib = 64;
+    cfg.cache_size_kib = 16;
     cfg.page_size = 4096;
+#if CONFIG_ESP_SQLITE3_FOREIGN_KEYS
     cfg.foreign_keys = true;
+#else
+    cfg.foreign_keys = false;
+#endif
     cfg.temp_store_memory = true;
 #if CONFIG_ESP_SQLITE3_ENABLE_WAL
     cfg.journal_mode = ESP_SQLITE3_JOURNAL_WAL;
@@ -117,6 +135,10 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
     char journal[32] = {0};
     TEST_STEP(esp_sqlite3_query_text(db, "PRAGMA journal_mode;", journal, sizeof(journal)));
     ESP_LOGI(TEST_TAG, "journal_mode = %s", journal);
+#if CONFIG_ESP_SQLITE3_ENABLE_WAL
+    TEST_CHECK(strcasecmp(journal, "wal") == 0,
+               "WAL profile compiled but journal_mode=%s", journal);
+#endif
 
     /* ---- 1. 建表 -------------------------------------------------------- */
     TEST_STEP(esp_sqlite3_exec(db,
@@ -157,12 +179,18 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
 
     /* ---- 3. UPDATE / DELETE -------------------------------------------- */
     TEST_STEP(esp_sqlite3_exec(db, "UPDATE t SET value=value+1 WHERE id<=10;"));
+    TEST_STEP(test_query_int64(db, "SELECT CAST(SUM(value) AS INTEGER) FROM t;", 7585));
     TEST_STEP(esp_sqlite3_exec(db, "DELETE FROM t WHERE id=100;"));
     TEST_STEP(test_query_int64(db, "SELECT COUNT(*) FROM t;", 99));
+    TEST_STEP(test_query_int64(db, "SELECT COUNT(*) FROM t WHERE id=100;", 0));
 
     /* ---- 4. JSON（SQLite 3.38+ 内建） ---------------------------------- */
+#if defined(SQLITE_OMIT_JSON)
+    ESP_LOGW(TEST_TAG, "JSON: skipped (SQLITE_OMIT_JSON)");
+#else
     TEST_STEP(test_query_int64(db,
         "SELECT json_extract('{\"a\":{\"b\":42}}', '$.a.b');", 42));
+#endif
 
     /* ---- 5. FTS5 -------------------------------------------------------- */
 #if defined(SQLITE_ENABLE_FTS5)
@@ -189,22 +217,38 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
 
     /* ---- 7. shox96 兼容函数 -------------------------------------------- */
     {
-        const char *text = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        char *sql = sqlite3_mprintf(
-            "SELECT CAST(shox96_0_2d(shox96_0_2c(%Q)) AS TEXT) = %Q;", text, text);
-        TEST_CHECK(sql != NULL, "mprintf failed");
-        esp_err_t err = test_query_int64(db, sql, 1);
-        sqlite3_free(sql);
-        TEST_CHECK(err == ESP_OK, "shox96 roundtrip failed");
+        static const char *samples[] = {
+            "",
+            "a",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "Hello, SQLite 3.54.1!\nTab\tCR\r\n",
+            "0123456789 0123456789 0123456789 0123456789",
+            "The quick brown fox jumps over the lazy dog. "
+            "The quick brown fox jumps over the lazy dog.",
+        };
+        for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+            char *sql = sqlite3_mprintf(
+                "SELECT CAST(shox96_0_2d(shox96_0_2c(%Q)) AS TEXT) = %Q;",
+                samples[i], samples[i]);
+            TEST_CHECK(sql != NULL, "mprintf failed");
+            esp_err_t err = test_query_int64(db, sql, 1);
+            sqlite3_free(sql);
+            TEST_CHECK(err == ESP_OK, "shox96 roundtrip %u failed", (unsigned)i);
+        }
         ESP_LOGI(TEST_TAG, "shox96: ok");
     }
 
     /* ---- 8. 完整性检查 -------------------------------------------------- */
+#if defined(SQLITE_OMIT_INTEGRITY_CHECK)
+    ESP_LOGW(TEST_TAG, "integrity_check: skipped (SQLITE_OMIT_INTEGRITY_CHECK)");
+#else
     {
         char check[256] = {0};
         TEST_STEP(esp_sqlite3_integrity_check(db, false, check, sizeof(check)));
+        TEST_CHECK(strcasecmp(check, "ok") == 0, "integrity_check=%s", check);
         ESP_LOGI(TEST_TAG, "integrity_check = %s", check);
     }
+#endif
 
     /* ---- 9. 备份 -------------------------------------------------------- */
     TEST_CHECK(strlen(db_path) + 5 < sizeof(backup_path), "db path too long");
@@ -221,9 +265,22 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
     test_remove_db(backup_path);
 
     /* ---- 10. VACUUM ----------------------------------------------------- */
-    TEST_STEP(esp_sqlite3_vacuum(db));
-    TEST_STEP(test_query_int64(db, "SELECT COUNT(*) FROM t;", 99));
-    ESP_LOGI(TEST_TAG, "VACUUM: ok");
+    TEST_STEP(esp_sqlite3_exec(db, "CREATE TABLE junk(x BLOB);"));
+    TEST_STEP(esp_sqlite3_exec(db, "INSERT INTO junk VALUES(zeroblob(32768));"));
+    TEST_STEP(esp_sqlite3_exec(db, "DELETE FROM junk;"));
+    {
+        int64_t free_before = 0;
+        int64_t free_after = 0;
+        TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA freelist_count;", &free_before));
+        TEST_CHECK(free_before > 0, "freelist_count before VACUUM is 0");
+        TEST_STEP(esp_sqlite3_vacuum(db));
+        TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA freelist_count;", &free_after));
+        TEST_CHECK(free_after < free_before, "VACUUM did not reduce freelist: %lld -> %lld",
+                   (long long)free_before, (long long)free_after);
+        TEST_STEP(test_query_int64(db, "SELECT COUNT(*) FROM t;", 99));
+        ESP_LOGI(TEST_TAG, "VACUUM: ok (freelist %lld -> %lld)",
+                 (long long)free_before, (long long)free_after);
+    }
 
     /* ---- 11. user_version / 迁移 --------------------------------------- */
     TEST_STEP(esp_sqlite3_set_user_version(db, 0));
@@ -236,6 +293,8 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
         int version = -1;
         TEST_STEP(esp_sqlite3_get_user_version(db, &version));
         TEST_CHECK(version == 2, "user_version=%d, expected 2", version);
+        TEST_STEP(test_query_int64(db,
+            "SELECT COUNT(*) FROM pragma_table_info('mig') WHERE name='note';", 1));
         ESP_LOGI(TEST_TAG, "migration: ok (user_version=%d)", version);
     }
 
@@ -243,6 +302,7 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
     {
         int64_t bytes = 0;
         TEST_STEP(esp_sqlite3_get_size(db, &bytes));
+        TEST_CHECK(bytes > 0, "database size is 0");
         ESP_LOGI(TEST_TAG, "database size = %lld bytes", (long long)bytes);
     }
 
@@ -252,19 +312,28 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
         int ckpt_frames = 0;
         TEST_STEP(esp_sqlite3_wal_checkpoint(db, SQLITE_CHECKPOINT_FULL,
                                             &log_frames, &ckpt_frames));
+        TEST_CHECK(log_frames > 0, "WAL checkpoint log_frames=0");
+        TEST_CHECK(ckpt_frames == log_frames,
+                   "WAL checkpoint incomplete: log=%d ckpt=%d", log_frames, ckpt_frames);
         ESP_LOGI(TEST_TAG, "wal_checkpoint: log=%d ckpt=%d", log_frames, ckpt_frames);
     }
 #endif
 
     /* ---- 13. 内存统计 --------------------------------------------------- */
+#if defined(CONFIG_ESP_SQLITE3_MEMSTATUS) && CONFIG_ESP_SQLITE3_MEMSTATUS
     {
         esp_sqlite3_mem_stats_t stats;
         TEST_STEP(esp_sqlite3_get_mem_stats(&stats));
+        TEST_CHECK(stats.memory_used > 0, "memory_used=0 with MEMSTATUS enabled");
+        TEST_CHECK(stats.malloc_count > 0, "malloc_count=0 with MEMSTATUS enabled");
         ESP_LOGI(TEST_TAG, "mem: used=%lld high=%lld pcache_slots=%lld overflow=%lld blocks=%lld",
                  (long long)stats.memory_used, (long long)stats.memory_highwater,
                  (long long)stats.pagecache_used, (long long)stats.pagecache_overflow,
                  (long long)stats.malloc_count);
     }
+#else
+    ESP_LOGW(TEST_TAG, "mem stats: skipped (MEMSTATUS disabled)");
+#endif
 
     ESP_LOGI(TEST_TAG, "===== esp_sqlite3 selftest PASSED =====");
     result = ESP_OK;

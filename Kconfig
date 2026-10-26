@@ -53,8 +53,8 @@ menu "ESP SQLite3（官方 SQLite 移植）"
     # ---------------------------------------------------------------------
     config ESP_SQLITE3_THREADSAFE
         bool "线程安全（SQLITE_THREADSAFE=1）"
+        depends on !ESP_SQLITE3_PROFILE_CRUD
         default y
-        default n if ESP_SQLITE3_PROFILE_CRUD
         help
             开启后使用 FreeRTOS 递归互斥量实现 SQLite 的串行化模式，
             多个任务可以各自打开连接访问同一个数据库。
@@ -62,8 +62,8 @@ menu "ESP SQLite3（官方 SQLite 移植）"
 
     config ESP_SQLITE3_MEMSTATUS
         bool "统计内存使用（sqlite3_status 可用）"
+        depends on !ESP_SQLITE3_PROFILE_CRUD
         default y
-        default n if ESP_SQLITE3_PROFILE_CRUD
         help
             关闭后 sqlite3_memory_used()/sqlite3_status() 返回 0，
             可略微降低开销。
@@ -88,16 +88,16 @@ menu "ESP SQLite3（官方 SQLite 移植）"
     config ESP_SQLITE3_CACHE_KIB
         int "默认页缓存大小（KiB）"
         range 8 1024
-        default 64
+        default 16
         help
             SQLITE_DEFAULT_CACHE_SIZE 的绝对值（KiB）。
             每打开一个连接都会占用这么多内存（实际按页分配）。
-            联网设备建议 32~128KiB。
+            无 PSRAM 的 ESP32-C5/C6 建议 8~16KiB；带 PSRAM 可 32~128KiB。
 
     config ESP_SQLITE3_LOOKASIDE
         bool "启用 Lookaside 小对象缓存"
+        depends on !ESP_SQLITE3_PROFILE_CRUD
         default y
-        default n if ESP_SQLITE3_PROFILE_CRUD
         help
             为每个连接预留少量固定大小的小对象槽位，减少 malloc 次数。
             默认 32 槽 x 256 字节 = 8KiB/连接。关闭可省内存但会变慢。
@@ -130,8 +130,8 @@ menu "ESP SQLite3（官方 SQLite 移植）"
 
     config ESP_SQLITE3_FOREIGN_KEYS
         bool "默认开启外键约束"
+        depends on !ESP_SQLITE3_PROFILE_CRUD
         default y
-        default n if ESP_SQLITE3_PROFILE_CRUD
 
     config ESP_SQLITE3_SECURE_DELETE
         bool "删除数据时清零（防恢复，增加 Flash 擦写）"
@@ -213,8 +213,8 @@ menu "ESP SQLite3（官方 SQLite 移植）"
 
     config ESP_SQLITE3_ENABLE_COLUMN_METADATA
         bool "列元数据 API（sqlite3_column_table_name 等）"
+        depends on !ESP_SQLITE3_PROFILE_CRUD
         default y
-        default n if ESP_SQLITE3_PROFILE_CRUD
 
     config ESP_SQLITE3_ENABLE_BYTECODE_VTAB
         bool "bytecode 虚拟表（调试用）"
@@ -235,13 +235,9 @@ menu "ESP SQLite3（官方 SQLite 移植）"
             数据库内部始终是 UTF-8，只有需要 sqlite3_bind_text16 等
             UTF-16 接口时才需要开启。
 
-    config ESP_SQLITE3_LOAD_EXTENSION
-        bool "动态加载扩展（需要 xDlOpen）"
-        default y if ESP_SQLITE3_PROFILE_MAX
-        default n
-        help
-            ESP-IDF 固件没有通用动态库加载器，默认关闭。
-            如需使用扩展，请把它们编译进固件并用 sqlite3_auto_extension 注册。
+    # 动态加载扩展需要 xDlOpen，ESP-IDF 固件没有通用动态库加载器，
+    # 因此始终定义 SQLITE_OMIT_LOAD_EXTENSION；扩展请编译进固件并用
+    # sqlite3_auto_extension 注册。
 
     # 注意：共享缓存与废弃 API 已统一移除，不再提供 Kconfig 开关。
 

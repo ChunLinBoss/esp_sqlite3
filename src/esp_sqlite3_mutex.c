@@ -7,12 +7,14 @@
  * 实现。这里全部使用递归信号量：
  *   - SQLITE_MUTEX_FAST 也按递归实现（语义更安全，代价很小）；
  *   - 静态互斥量在 xMutexInit 中一次性创建，避免运行时并发创建；
- *   - 动态互斥量使用 SQLite 自己的分配器，便于统计和 PSRAM 管理。
+ *   - 动态互斥量使用 ESP heap，不能使用 sqlite3_malloc：初始化期间
+ *     sqlite3_malloc 会再次触发 sqlite3_initialize()，造成无限递归。
  */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -105,7 +107,7 @@ static sqlite3_mutex *esp_sqlite3_mutex_alloc(int id)
         return NULL;
     }
 
-    esp_sqlite3_mutex_t *m = sqlite3_malloc64(sizeof(*m));
+    esp_sqlite3_mutex_t *m = heap_caps_malloc(sizeof(*m), MALLOC_CAP_8BIT);
     if (m == NULL) {
         return NULL;
     }
@@ -113,7 +115,7 @@ static sqlite3_mutex *esp_sqlite3_mutex_alloc(int id)
     m->sem = xSemaphoreCreateRecursiveMutex();
     m->is_static = false;
     if (m->sem == NULL) {
-        sqlite3_free(m);
+        heap_caps_free(m);
         return NULL;
     }
 
@@ -135,7 +137,7 @@ static void esp_sqlite3_mutex_free(sqlite3_mutex *p)
     if (m->sem != NULL) {
         vSemaphoreDelete(m->sem);
     }
-    sqlite3_free(m);
+    heap_caps_free(m);
 }
 
 static void esp_sqlite3_mutex_enter(sqlite3_mutex *p)

@@ -262,8 +262,8 @@ I (...) selftest_main: SELFTEST RESULT: PASS
 | `database is locked` | 两个连接同时写，busy_timeout 太短 | 增大 `busy_timeout_ms`；避免长事务 |
 | `disk I/O error` | `fsync/ftruncate` 不支持，或 Flash 满 | 检查 FS；用 `esp_spiffs_info` 看剩余空间 |
 | `database disk image is malformed` | 旧版 RAM journal + 掉电损坏 | 用 `PRAGMA integrity_check`；从备份恢复 |
-| `out of memory` | 页缓存/排序/PSRAM 不足 | 降 `cache_size_kib`；关 FTS5；检查 PSRAM |
-| `stack overflow` | 复杂 SQL/递归 CTE/触发器 | 增大任务栈；限制递归深度 |
+| `out of memory` | 页缓存/排序/PSRAM 不足 | 降 `cache_size_kib`（无 PSRAM 用 8~16）；关 FTS5；检查 PSRAM |
+| `stack overflow` | 复杂 SQL/递归 CTE/触发器 | 增大任务栈（FULL 自测在 C5 实测 32KB）；限制递归深度 |
 | WAL 打开失败 | MINIMAL 档位关闭了 WAL | 切 FULL/STANDARD/MAX 或 `journal_mode=DELETE` |
 | `PRAGMA foreign_keys` 无效 | 旧版编译宏 `SQLITE_OMIT_FOREIGN_KEY` | 本组件默认不 OMIT；确认档位 |
 | IDF5 编译报 `mutexIsInit` 未声明 | `CONFIG_COMPILER_ASSERT_NDEBUG_EVALUATE` | 确认 `esp_sqlite3_force_ndebug.h` 被 `-include` |

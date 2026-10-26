@@ -173,10 +173,13 @@ esp_err_t esp_sqlite3_init(void);
 /**
  * @brief 关闭 SQLite 运行时
  *
- * 会调用 sqlite3_shutdown()。调用前必须关闭所有数据库连接。
+ * 会检查是否还有未关闭的数据库连接；有连接时返回
+ * ESP_ERR_INVALID_STATE，并且不会调用 sqlite3_shutdown()。
  * 一般只在测试/重启前使用，正常业务无需调用。
+ *
+ * @return ESP_OK 或错误码
  */
-void esp_sqlite3_deinit(void);
+esp_err_t esp_sqlite3_deinit(void);
 
 /** @brief 是否已经初始化 */
 bool esp_sqlite3_is_initialized(void);
@@ -204,8 +207,13 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
 /** @brief 使用默认配置打开数据库（不存在则创建） */
 esp_err_t esp_sqlite3_open_simple(const char *path, esp_sqlite3_t **out_db);
 
-/** @brief 关闭数据库；句柄置空由调用者负责 */
-void esp_sqlite3_close(esp_sqlite3_t *db);
+/**
+ * @brief 关闭数据库；句柄置空由调用者负责
+ *
+ * 使用 sqlite3_close() 而不是 close_v2()，因此如果仍有未 finalize 的语句，
+ * 会返回 ESP_ERR_INVALID_STATE，连接不会被释放，调用者可先清理语句再重试。
+ */
+esp_err_t esp_sqlite3_close(esp_sqlite3_t *db);
 
 /** @brief 获取底层 sqlite3*，用于调用原生 API */
 sqlite3 *esp_sqlite3_handle(esp_sqlite3_t *db);

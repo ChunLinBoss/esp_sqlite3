@@ -13,6 +13,7 @@
  *    - esp_sqlite_random()      : 32 位硬件随机数
  *    - esp_sqlite_mem_used()    : 当前 SQLite 堆内存占用
  */
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,17 +43,30 @@ static int esp_sqlite3_encode_unsigned_varint(uint8_t *buffer, uint64_t value)
     return encoded;
 }
 
-static uint64_t esp_sqlite3_decode_unsigned_varint(const uint8_t *data, int *decoded_bytes)
+static esp_err_t esp_sqlite3_decode_unsigned_varint(const uint8_t *data, int max_bytes,
+                                                    uint64_t *out_value, int *decoded_bytes)
 {
-    int i = 0;
+    if (data == NULL || out_value == NULL || decoded_bytes == NULL || max_bytes <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     uint64_t value = 0;
     int shift = 0;
-    do {
-        value |= (uint64_t)(data[i] & 0x7F) << shift;
+    int i = 0;
+    while (i < max_bytes && i < 10) {
+        uint8_t byte = data[i++];
+        if (shift >= 64 || (shift == 63 && (byte & 0x7E) != 0)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        value |= (uint64_t)(byte & 0x7F) << shift;
         shift += 7;
-    } while ((data[i++] & 0x80) != 0);
-    *decoded_bytes = i;
-    return value;
+        if ((byte & 0x80) == 0) {
+            *out_value = value;
+            *decoded_bytes = i;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_INVALID_ARG;
 }
 
 /* -------------------------------------------------------------------------
@@ -77,6 +91,10 @@ static void esp_sqlite3_shox96_compress(sqlite3_context *context, int argc, sqli
     int varint_len = esp_sqlite3_encode_unsigned_varint(varint, (uint64_t)n_in);
 
     /* 与旧版一致的上界：13 + len + len/1000，再预留 varint 长度 */
+    if (n_in < 0 || n_in > INT_MAX - 64) {
+        sqlite3_result_error(context, "shox96 input too large", -1);
+        return;
+    }
     int out_cap = 13 + n_in + (n_in + 999) / 1000 + varint_len;
     unsigned char *out = sqlite3_malloc64((sqlite3_uint64)out_cap);
     if (out == NULL) {
@@ -86,8 +104,9 @@ static void esp_sqlite3_shox96_compress(sqlite3_context *context, int argc, sqli
 
     memcpy(out, varint, (size_t)varint_len);
     int n_out = shox96_0_2_compress((const char *)in, n_in,
-                                    (char *)out + varint_len, NULL);
-    if (n_out < 0) {
+                                    (char *)out + varint_len,
+                                    out_cap - varint_len, NULL);
+    if (n_out < 0 || n_out > out_cap - varint_len) {
         sqlite3_free(out);
         sqlite3_result_error(context, "shox96 compress failed", -1);
         return;
@@ -109,14 +128,17 @@ static void esp_sqlite3_shox96_decompress(sqlite3_context *context, int argc, sq
 
     int n_in = sqlite3_value_bytes(argv[0]);
     const unsigned char *in = (const unsigned char *)sqlite3_value_blob(argv[0]);
-    if (in == NULL || n_in < 2) {
+    if (in == NULL || n_in < 1) {
         sqlite3_result_error(context, "shox96 blob too short", -1);
         return;
     }
 
     int varint_len = 0;
-    uint64_t out_len64 = esp_sqlite3_decode_unsigned_varint(in, &varint_len);
-    if (varint_len >= n_in || out_len64 > (uint64_t)INT32_MAX) {
+    uint64_t out_len64 = 0;
+    esp_err_t verr = esp_sqlite3_decode_unsigned_varint(in, n_in, &out_len64, &varint_len);
+    if (verr != ESP_OK || varint_len > n_in ||
+        (varint_len == n_in && out_len64 != 0) ||
+        out_len64 > (uint64_t)INT32_MAX) {
         sqlite3_result_error(context, "invalid shox96 header", -1);
         return;
     }
@@ -127,9 +149,10 @@ static void esp_sqlite3_shox96_decompress(sqlite3_context *context, int argc, sq
         return;
     }
 
+    int out_cap = (out_len64 > 0) ? (int)out_len64 : 1;
     int n_out = shox96_0_2_decompress((const char *)in + varint_len,
-                                      n_in - varint_len, (char *)out, NULL);
-    if (n_out < 0) {
+                                      n_in - varint_len, (char *)out, out_cap, NULL);
+    if (n_out < 0 || n_out != (int)out_len64) {
         sqlite3_free(out);
         sqlite3_result_error(context, "shox96 decompress failed", -1);
         return;

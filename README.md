@@ -94,7 +94,7 @@ esp_sqlite3_config_init(&cfg);
 cfg.path = "/db/app.db";          // 需要先挂载 SPIFFS/FATFS/LittleFS
 cfg.journal_mode = ESP_SQLITE3_JOURNAL_WAL;
 cfg.synchronous = ESP_SQLITE3_SYNC_NORMAL;
-cfg.cache_size_kib = 64;
+cfg.cache_size_kib = 16;
 ESP_ERROR_CHECK(esp_sqlite3_open(&cfg, &db));
 
 ESP_ERROR_CHECK(esp_sqlite3_exec(db,
@@ -157,7 +157,8 @@ ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
 ## 兼容性
 
 - ESP-IDF **v5.5.4**：编译通过（GCC 14.2，ESP32-C5）。
-- ESP-IDF **v6.1**：编译通过（GCC 15.2，ESP32-C5）。
+- ESP-IDF **v6.1**：编译通过（GCC 15.2，ESP32-C5）；MAX / FULL / STANDARD /
+  MINIMAL / CRUD 五档已在 C5 开发板逐档烧录，自测全部 PASS。
 - 目标芯片：ESP32-C5（RISC-V）；代码不使用 Xtensa 专用指令，ESP32/S3/C3/C6
   等同样适用。
 - 文件系统：任何实现了 POSIX `open/read/write/lseek/close/ftruncate/fsync/

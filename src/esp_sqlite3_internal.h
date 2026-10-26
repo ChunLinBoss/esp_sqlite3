@@ -84,6 +84,9 @@ void esp_sqlite3_log_error(sqlite3 *db, int rc, const char *what);
 /** 内部：确保运行时已初始化 */
 esp_err_t esp_sqlite3_ensure_init(void);
 
+/** 内部：是否正在执行初始化（供 VFS 注册判断） */
+bool esp_sqlite3_is_initializing(void);
+
 #ifdef __cplusplus
 }
 #endif

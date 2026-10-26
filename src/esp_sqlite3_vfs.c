@@ -60,7 +60,7 @@ static esp_sqlite3_vfs_stats_t s_stats;
 
 /** 进程内文件锁状态（按规范化路径共享） */
 typedef struct esp_sqlite3_vfs_lock {
-    char path[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char path[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     int n_shared;                       /**< 当前持有 SHARED 的文件句柄数 */
     struct esp_sqlite3_vfs_file *reserved;       /**< RESERVED 持有者 */
     struct esp_sqlite3_vfs_file *pending;        /**< PENDING 持有者 */
@@ -77,7 +77,7 @@ typedef struct {
 
 /** WAL 共享内存区域（每个数据库一份） */
 typedef struct esp_sqlite3_vfs_shm {
-    char path[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char path[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     int n_ref;                          /**< 引用计数 */
     int n_region;                       /**< 已分配区域数 */
     int region_size;                    /**< 每个区域大小 */
@@ -95,9 +95,10 @@ typedef struct esp_sqlite3_vfs_file {
     bool delete_on_close;               /**< 关闭后删除（临时文件/日志） */
     bool is_wal;                        /**< 是否为 -wal 文件 */
     bool persist_wal;                   /**< SQLITE_FCNTL_PERSIST_WAL */
-    char path[CONFIG_ESP_SQLITE3_MAX_PATH]; /**< 规范化后的完整路径 */
+    char path[CONFIG_ESP_SQLITE3_MAX_PATH + 16]; /**< 规范化后的完整路径 */
     esp_sqlite3_vfs_lock_t *lock;                /**< 文件锁状态 */
     esp_sqlite3_vfs_shm_t *shm;                  /**< WAL 共享内存（仅 -wal 文件） */
+    uint8_t shared_locks[ESP_SQLITE3_VFS_SHM_NLOCK]; /**< 本文件持有的 WAL read lock 槽位 */
 } esp_sqlite3_vfs_file_t;
 
 /* -------------------------------------------------------------------------
@@ -109,6 +110,11 @@ static SemaphoreHandle_t s_vfs_mutex = NULL;
 static esp_sqlite3_vfs_lock_t *s_lock_list = NULL;
 static esp_sqlite3_vfs_shm_t *s_shm_list = NULL;
 static bool s_registered = false;
+
+/* SQLITE_FCNTL_PERSIST_WAL 标记的数据库路径（不含 -wal 后缀） */
+#define ESP_SQLITE3_VFS_MAX_PERSIST_WAL 4
+static char s_persist_wal[ESP_SQLITE3_VFS_MAX_PERSIST_WAL][CONFIG_ESP_SQLITE3_MAX_PATH + 16];
+static int s_persist_wal_count = 0;
 
 /* -------------------------------------------------------------------------
  * 小工具
@@ -132,6 +138,127 @@ static inline void esp_sqlite3_vfs_unlock_global(void)
     (void)xSemaphoreGiveRecursive(s_vfs_mutex);
 }
 
+static bool esp_sqlite3_vfs_persist_wal_contains(const char *path)
+{
+    for (int i = 0; i < s_persist_wal_count; i++) {
+        if (strcmp(s_persist_wal[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void esp_sqlite3_vfs_persist_wal_set(const char *path, bool persist)
+{
+    int found = -1;
+    for (int i = 0; i < s_persist_wal_count; i++) {
+        if (strcmp(s_persist_wal[i], path) == 0) {
+            found = i;
+            break;
+        }
+    }
+
+    if (persist) {
+        if (found >= 0) {
+            return;
+        }
+        if (s_persist_wal_count >= ESP_SQLITE3_VFS_MAX_PERSIST_WAL) {
+            return;
+        }
+        strncpy(s_persist_wal[s_persist_wal_count], path,
+                sizeof(s_persist_wal[0]) - 1);
+        s_persist_wal[s_persist_wal_count][sizeof(s_persist_wal[0]) - 1] = '\0';
+        s_persist_wal_count++;
+    } else if (found >= 0) {
+        s_persist_wal[found][0] = '\0';
+        for (int i = found; i + 1 < s_persist_wal_count; i++) {
+            memcpy(s_persist_wal[i], s_persist_wal[i + 1], sizeof(s_persist_wal[0]));
+        }
+        s_persist_wal_count--;
+    }
+}
+
+/**
+ * @brief 词法规范化路径：合并重复 '/'，去掉 '.'，消解 '..'
+ *
+ * 不做大小写折叠：SPIFFS/LittleFS 区分大小写，FATFS 不区分；
+ * 调用者应保持同一数据库使用同一种大小写写法。
+ */
+static esp_err_t esp_sqlite3_vfs_normalize_path(const char *in, char *out, size_t out_len)
+{
+    if (in == NULL || out == NULL || out_len < 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(in, ":memory:") == 0) {
+        if (strlen(in) >= out_len) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        strcpy(out, in);
+        return ESP_OK;
+    }
+
+    bool absolute = (in[0] == '/');
+    size_t olen = 0;
+    if (absolute) {
+        out[olen++] = '/';
+    }
+
+    const char *p = in;
+    while (*p != '\0') {
+        while (*p == '/') {
+            p++;
+        }
+        const char *seg = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+        size_t seg_len = (size_t)(p - seg);
+        if (seg_len == 0 || (seg_len == 1 && seg[0] == '.')) {
+            continue;
+        }
+
+        bool pop = false;
+        if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (olen > (absolute ? 1u : 0u)) {
+                pop = true;
+            } else if (absolute) {
+                continue; /* 根目录之上的 '..' 直接忽略 */
+            }
+        }
+
+        if (pop) {
+            if (olen > 0 && out[olen - 1] == '/') {
+                olen--;
+            }
+            while (olen > (absolute ? 1u : 0u) && out[olen - 1] != '/') {
+                olen--;
+            }
+            if (olen > (absolute ? 1u : 0u) && out[olen - 1] == '/') {
+                olen--;
+            }
+            continue;
+        }
+
+        if (olen > 0 && out[olen - 1] != '/') {
+            if (olen + 1 >= out_len) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out[olen++] = '/';
+        }
+        if (olen + seg_len >= out_len) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        memcpy(out + olen, seg, seg_len);
+        olen += seg_len;
+    }
+
+    if (olen == 0) {
+        out[olen++] = absolute ? '/' : '.';
+    }
+    out[olen] = '\0';
+    return ESP_OK;
+}
+
 /**
  * @brief 规范化路径：绝对路径原样，相对路径拼默认目录
  */
@@ -141,27 +268,28 @@ esp_err_t esp_sqlite3_vfs_make_path(const char *path, char *out, size_t out_len)
         return ESP_ERR_INVALID_ARG;
     }
 
+    char tmp[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     int n = 0;
     if (path[0] == '/' || strcmp(path, ":memory:") == 0) {
-        n = snprintf(out, out_len, "%s", path);
+        n = snprintf(tmp, sizeof(tmp), "%s", path);
     } else {
         const char *dir = CONFIG_ESP_SQLITE3_DEFAULT_DIR;
         size_t dir_len = strlen(dir);
         /* 避免出现 "//" 或缺少 "/" */
         if (dir_len > 0 && dir[dir_len - 1] == '/') {
-            n = snprintf(out, out_len, "%s%s", dir, path);
+            n = snprintf(tmp, sizeof(tmp), "%s%s", dir, path);
         } else {
-            n = snprintf(out, out_len, "%s/%s", dir, path);
+            n = snprintf(tmp, sizeof(tmp), "%s/%s", dir, path);
         }
     }
 
-    if (n < 0 || (size_t)n >= out_len) {
+    if (n < 0 || (size_t)n >= sizeof(tmp)) {
         if (out_len > 0) {
             out[0] = '\0';
         }
         return ESP_ERR_INVALID_SIZE;
     }
-    return ESP_OK;
+    return esp_sqlite3_vfs_normalize_path(tmp, out, out_len);
 }
 
 /** 生成临时文件路径（不带扩展名） */
@@ -377,30 +505,111 @@ static int esp_sqlite3_vfs_read(sqlite3_file *id, void *buffer, int amount, sqli
         return SQLITE_OK;
     }
 
+    /*
+     * SPIFFS 的 lseek 不允许越过文件末尾（会返回 EIO），而 SQLite 在
+     * 打开新库/读页尾时经常会“读文件末尾之后”的位置。VFS 规范要求
+     * 这种情况返回 SHORT_READ，并把未读部分清零，不能把 EIO 直接上抛。
+     */
+    struct stat st;
+    if (fstat(file->fd, &st) != 0) {
+        ESP_SQLITE3_LOGE("fstat read %s failed: errno=%d", file->path, errno);
+        return SQLITE_IOERR_FSTAT;
+    }
+    sqlite3_int64 file_size = (sqlite3_int64)st.st_size;
+    if (offset >= file_size) {
+        memset(buffer, 0, (size_t)amount);
+        ESP_SQLITE3_STAT_ADD(read_ops, 1);
+        return SQLITE_IOERR_SHORT_READ;
+    }
+
     int done = 0;
-    while (done < amount) {
+    int want = amount;
+    sqlite3_int64 avail = file_size - offset;
+    if (avail < (sqlite3_int64)want) {
+        want = (int)avail;
+    }
+
+    while (done < want) {
         if (lseek(file->fd, (off_t)(offset + done), SEEK_SET) < 0) {
+            ESP_SQLITE3_LOGE("lseek read %s off=%lld failed: errno=%d",
+                            file->path, (long long)(offset + done), errno);
             return SQLITE_IOERR_SEEK;
         }
-        ssize_t n = read(file->fd, (uint8_t *)buffer + done, (size_t)(amount - done));
+        ssize_t n = read(file->fd, (uint8_t *)buffer + done, (size_t)(want - done));
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            ESP_SQLITE3_LOGE("read(%s, %d) failed: errno=%d", file->path, want - done, errno);
             return SQLITE_IOERR_READ;
         }
         if (n == 0) {
-            /* 文件尾部：剩余部分补 0，并告知 SQLite 是短读 */
-            memset((uint8_t *)buffer + done, 0, (size_t)(amount - done));
-            ESP_SQLITE3_STAT_ADD(read_ops, 1);
-            ESP_SQLITE3_STAT_ADD(bytes_read, (uint64_t)done);
-            return SQLITE_IOERR_SHORT_READ;
+            break;
         }
         done += (int)n;
     }
 
     ESP_SQLITE3_STAT_ADD(read_ops, 1);
     ESP_SQLITE3_STAT_ADD(bytes_read, (uint64_t)done);
+    if (done < amount) {
+        /* 文件尾部：剩余部分补 0，并告知 SQLite 是短读 */
+        memset((uint8_t *)buffer + done, 0, (size_t)(amount - done));
+        return SQLITE_IOERR_SHORT_READ;
+    }
+    return SQLITE_OK;
+}
+
+/** 把 POSIX errno 映射成 SQLite I/O 错误码 */
+static int esp_sqlite3_vfs_errno_to_ioerr(int err, int fallback)
+{
+    switch (err) {
+    case ENOSPC:
+        return SQLITE_FULL;
+    case EROFS:
+    case EPERM:
+    case EACCES:
+        return SQLITE_READONLY;
+    default:
+        return fallback;
+    }
+}
+
+/**
+ * @brief 把文件扩展到指定长度（用 0 填充）
+ *
+ * SPIFFS 的 lseek 不允许越过 EOF，所以 SQLite 写稀疏区域时必须先显式
+ * 补零扩展。正常数据库/ WAL 写入是顺序的，不会频繁走到这里。
+ */
+static int esp_sqlite3_vfs_extend_to(esp_sqlite3_vfs_file_t *file, sqlite3_int64 target)
+{
+    struct stat st;
+    if (fstat(file->fd, &st) != 0) {
+        return SQLITE_IOERR_FSTAT;
+    }
+    sqlite3_int64 current = (sqlite3_int64)st.st_size;
+    if (target <= current) {
+        return SQLITE_OK;
+    }
+    if (lseek(file->fd, 0, SEEK_END) < 0) {
+        return SQLITE_IOERR_SEEK;
+    }
+
+    uint8_t zeros[256] = {0};
+    sqlite3_int64 remain = target - current;
+    while (remain > 0) {
+        size_t chunk = (remain > (sqlite3_int64)sizeof(zeros)) ? sizeof(zeros) : (size_t)remain;
+        ssize_t n = write(file->fd, zeros, chunk);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return esp_sqlite3_vfs_errno_to_ioerr(errno, SQLITE_IOERR_WRITE);
+        }
+        if (n == 0) {
+            return SQLITE_IOERR_WRITE;
+        }
+        remain -= n;
+    }
     return SQLITE_OK;
 }
 
@@ -414,9 +623,18 @@ static int esp_sqlite3_vfs_write(sqlite3_file *id, const void *buffer, int amoun
         return SQLITE_OK;
     }
 
+    int rc = esp_sqlite3_vfs_extend_to(file, offset);
+    if (rc != SQLITE_OK) {
+        ESP_SQLITE3_LOGE("extend %s to %lld failed: rc=%d", file->path,
+                        (long long)offset, rc);
+        return rc;
+    }
+
     int done = 0;
     while (done < amount) {
         if (lseek(file->fd, (off_t)(offset + done), SEEK_SET) < 0) {
+            ESP_SQLITE3_LOGE("lseek write %s off=%lld failed: errno=%d",
+                            file->path, (long long)(offset + done), errno);
             return SQLITE_IOERR_SEEK;
         }
         ssize_t n = write(file->fd, (const uint8_t *)buffer + done, (size_t)(amount - done));
@@ -424,7 +642,10 @@ static int esp_sqlite3_vfs_write(sqlite3_file *id, const void *buffer, int amoun
             if (errno == EINTR) {
                 continue;
             }
-            return SQLITE_IOERR_WRITE;
+            int ioerr = esp_sqlite3_vfs_errno_to_ioerr(errno, SQLITE_IOERR_WRITE);
+            ESP_SQLITE3_LOGE("write(%s, %d) failed: errno=%d rc=%d",
+                            file->path, amount, errno, ioerr);
+            return ioerr;
         }
         if (n == 0) {
             return SQLITE_IOERR_WRITE;
@@ -440,10 +661,18 @@ static int esp_sqlite3_vfs_write(sqlite3_file *id, const void *buffer, int amoun
 static int esp_sqlite3_vfs_truncate(sqlite3_file *id, sqlite3_int64 size)
 {
     esp_sqlite3_vfs_file_t *file = (esp_sqlite3_vfs_file_t *)id;
-    if (ftruncate(file->fd, (off_t)size) != 0) {
-        ESP_SQLITE3_LOGE("ftruncate(%s, %lld) failed: errno=%d", file->path,
-                        (long long)size, errno);
+    if (size < 0) {
         return SQLITE_IOERR_TRUNCATE;
+    }
+    int rc = esp_sqlite3_vfs_extend_to(file, size);
+    if (rc != SQLITE_OK) {
+        return rc;
+    }
+    if (ftruncate(file->fd, (off_t)size) != 0) {
+        int ioerr = esp_sqlite3_vfs_errno_to_ioerr(errno, SQLITE_IOERR_TRUNCATE);
+        ESP_SQLITE3_LOGE("ftruncate(%s, %lld) failed: errno=%d rc=%d", file->path,
+                        (long long)size, errno, ioerr);
+        return ioerr;
     }
     ESP_SQLITE3_STAT_ADD(truncate_ops, 1);
     return SQLITE_OK;
@@ -640,6 +869,9 @@ static int esp_sqlite3_vfs_file_control(sqlite3_file *id, int op, void *arg)
     case SQLITE_FCNTL_PERSIST_WAL:
         if (arg != NULL) {
             file->persist_wal = (*(int *)arg != 0);
+            esp_sqlite3_vfs_lock_global();
+            esp_sqlite3_vfs_persist_wal_set(file->path, file->persist_wal);
+            esp_sqlite3_vfs_unlock_global();
         }
         return SQLITE_OK;
 
@@ -731,9 +963,13 @@ static int esp_sqlite3_vfs_shm_map(sqlite3_file *id, int iPg, int pgsz, int bExt
 
     esp_sqlite3_vfs_shm_t *shm = file->shm;
 
-    if (iPg < 0) {
+    if (iPg < 0 || pgsz <= 0) {
         esp_sqlite3_vfs_unlock_global();
         return SQLITE_IOERR;
+    }
+    if (shm->region_size != 0 && shm->region_size != pgsz) {
+        esp_sqlite3_vfs_unlock_global();
+        return SQLITE_IOERR_SHMSIZE;
     }
 
     if (iPg >= shm->n_region) {
@@ -785,6 +1021,9 @@ static int esp_sqlite3_vfs_shm_lock(sqlite3_file *id, int offset, int n, int fla
     int rc = SQLITE_OK;
     bool is_unlock = (flags & SQLITE_SHM_UNLOCK) != 0;
     bool is_exclusive = (flags & SQLITE_SHM_EXCLUSIVE) != 0;
+    uint8_t acquired_shared[ESP_SQLITE3_VFS_SHM_NLOCK] = {0};
+    uint8_t acquired_excl[ESP_SQLITE3_VFS_SHM_NLOCK] = {0};
+    int failed_at = offset + n;
 
     esp_sqlite3_vfs_lock_global();
 
@@ -796,38 +1035,48 @@ static int esp_sqlite3_vfs_shm_lock(sqlite3_file *id, int offset, int n, int fla
                 if (slot->excl == file) {
                     slot->excl = NULL;
                 }
-            } else {
+            } else if (file->shared_locks[i] > 0) {
+                file->shared_locks[i]--;
                 if (slot->n_shared > 0) {
                     slot->n_shared--;
                 }
             }
         } else if (is_exclusive) {
-            if ((slot->excl != NULL && slot->excl != file) || slot->n_shared > 0) {
+            if ((slot->excl != NULL && slot->excl != file) ||
+                slot->n_shared > 0 || file->shared_locks[i] > 0) {
                 rc = SQLITE_BUSY;
+                failed_at = i;
                 break;
+            }
+            if (slot->excl != file) {
+                acquired_excl[i - offset] = 1;
             }
             slot->excl = file;
         } else {
             if (slot->excl != NULL && slot->excl != file) {
                 rc = SQLITE_BUSY;
+                failed_at = i;
                 break;
             }
             slot->n_shared++;
+            file->shared_locks[i]++;
+            acquired_shared[i - offset] = 1;
         }
     }
 
-    /* 批量加锁失败时，回滚已经成功的部分，避免状态泄漏 */
+    /* 批量加锁失败时，只回滚本次真正获取的槽位，不能释放别人的读锁 */
     if (rc != SQLITE_OK && !is_unlock) {
-        for (int i = offset; i < offset + n; i++) {
+        for (int i = offset; i < failed_at; i++) {
             esp_sqlite3_vfs_shm_lock_t *slot = &file->shm->locks[i];
-            if (is_exclusive) {
-                if (slot->excl == file) {
-                    slot->excl = NULL;
+            int idx = i - offset;
+            if (acquired_shared[idx] && slot->n_shared > 0) {
+                slot->n_shared--;
+                if (file->shared_locks[i] > 0) {
+                    file->shared_locks[i]--;
                 }
-            } else {
-                if (slot->n_shared > 0) {
-                    slot->n_shared--;
-                }
+            }
+            if (acquired_excl[idx] && slot->excl == file) {
+                slot->excl = NULL;
             }
         }
     }
@@ -853,6 +1102,21 @@ static int esp_sqlite3_vfs_shm_unmap(sqlite3_file *id, int delete_flag)
 
     if (file->shm != NULL) {
         esp_sqlite3_vfs_lock_global();
+        /* 关闭连接/重新映射前，释放本文件仍持有的所有 WAL 锁 */
+        for (int i = 0; i < ESP_SQLITE3_VFS_SHM_NLOCK; i++) {
+            esp_sqlite3_vfs_shm_lock_t *slot = &file->shm->locks[i];
+            if (file->shared_locks[i] > 0) {
+                if (slot->n_shared >= file->shared_locks[i]) {
+                    slot->n_shared -= file->shared_locks[i];
+                } else {
+                    slot->n_shared = 0;
+                }
+                file->shared_locks[i] = 0;
+            }
+            if (slot->excl == file) {
+                slot->excl = NULL;
+            }
+        }
         esp_sqlite3_shm_put(file->shm);
         esp_sqlite3_vfs_unlock_global();
         file->shm = NULL;
@@ -901,14 +1165,21 @@ static int esp_sqlite3_vfs_open(sqlite3_vfs *vfs, const char *path, sqlite3_file
     esp_sqlite3_vfs_file_t *f = (esp_sqlite3_vfs_file_t *)file;
     f->fd = -1;
 
+    /*
+     * SQLite 允许 path 为 NULL：此时必须生成唯一的临时文件名。
+     * SQLITE_OPEN_DELETEONCLOSE 的临时库、子日志和外部排序都依赖这个契约。
+     */
+    char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     if (path == NULL) {
-        return SQLITE_CANTOPEN;
-    }
-
-    char full[CONFIG_ESP_SQLITE3_MAX_PATH];
-    if (path[0] == '\0') {
-        /* 临时库路径为空：生成一个唯一的绝对路径 */
         esp_sqlite3_vfs_make_temp_path(full, sizeof(full));
+        if (full[0] == '\0') {
+            return SQLITE_CANTOPEN;
+        }
+    } else if (path[0] == '\0') {
+        esp_sqlite3_vfs_make_temp_path(full, sizeof(full));
+        if (full[0] == '\0') {
+            return SQLITE_CANTOPEN;
+        }
     } else {
         esp_err_t err = esp_sqlite3_vfs_make_path(path, full, sizeof(full));
         if (err != ESP_OK) {
@@ -917,29 +1188,63 @@ static int esp_sqlite3_vfs_open(sqlite3_vfs *vfs, const char *path, sqlite3_file
         }
     }
 
-    int oflags = 0;
-    if (flags & SQLITE_OPEN_READONLY) {
-        oflags = O_RDONLY;
-    } else {
-        oflags = O_RDWR;
-    }
-    if (flags & SQLITE_OPEN_CREATE) {
-        oflags |= O_CREAT;
-    }
-    /*
-     * 不映射 SQLITE_OPEN_EXCLUSIVE 到 O_EXCL：
-     * SPIFFS/LittleFS 对 O_EXCL 的支持并不一致，而 ESP-IDF 是单进程环境，
-     * 由 SQLite 自身的文件锁已经足够。
-     */
+    int oflags = (flags & SQLITE_OPEN_READONLY) ? O_RDONLY : O_RDWR;
+    bool wants_create = (flags & SQLITE_OPEN_CREATE) != 0;
+    bool wants_exclusive = (flags & SQLITE_OPEN_EXCLUSIVE) != 0;
+    int fd = -1;
+    int saved_errno = 0;
 
-    f->fd = open(full, oflags, 0666);
-    if (f->fd < 0) {
-        ESP_SQLITE3_LOGD("open(%s, 0x%x) failed: errno=%d", full, oflags, errno);
+    /*
+     * 关键：ESP-IDF 6.1 的 SPIFFS 只在 O_CREAT|O_EXCL 或 O_CREAT|O_TRUNC
+     * 时才真正创建文件，单独的 O_CREAT 会被丢弃。这里先尝试 O_EXCL 创建，
+     * 已存在时再按普通模式打开；不能给已有数据库加 O_TRUNC，否则会清空数据。
+     */
+    if (wants_create) {
+        fd = open(full, oflags | O_CREAT | O_EXCL, 0666);
+        if (fd < 0) {
+            saved_errno = errno;
+            if (!wants_exclusive && saved_errno == EEXIST) {
+                fd = open(full, oflags);
+                if (fd < 0) {
+                    saved_errno = errno;
+                }
+            }
+        }
+    } else {
+        fd = open(full, oflags);
+        if (fd < 0) {
+            saved_errno = errno;
+        }
+    }
+
+    int actual_flags = flags;
+    if (fd < 0 && !(flags & SQLITE_OPEN_READONLY) &&
+        (saved_errno == EACCES || saved_errno == EROFS || saved_errno == EPERM)) {
+        /* 只读挂载/写保护介质：按 SQLite VFS 约定降级为只读打开 */
+        fd = open(full, O_RDONLY);
+        if (fd >= 0) {
+            actual_flags = (flags & ~(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) |
+                           SQLITE_OPEN_READONLY;
+            ESP_SQLITE3_LOGW("open %s read-write failed, fallback to read-only", full);
+        } else {
+            saved_errno = errno;
+        }
+    }
+
+    if (fd < 0) {
+        ESP_SQLITE3_LOGD("open(%s, 0x%x) failed: errno=%d", full, oflags, saved_errno);
+        if (saved_errno == ENOSPC) {
+            return SQLITE_FULL;
+        }
+        if (saved_errno == EACCES || saved_errno == EROFS || saved_errno == EPERM) {
+            return SQLITE_READONLY;
+        }
         return SQLITE_CANTOPEN;
     }
+    f->fd = fd;
 
     strncpy(f->path, full, sizeof(f->path) - 1);
-    f->open_flags = flags;
+    f->open_flags = actual_flags;
     f->delete_on_close = (flags & SQLITE_OPEN_DELETEONCLOSE) != 0;
     f->is_wal = (flags & SQLITE_OPEN_WAL) != 0;
     f->lock_level = SQLITE_LOCK_NONE;
@@ -956,7 +1261,7 @@ static int esp_sqlite3_vfs_open(sqlite3_vfs *vfs, const char *path, sqlite3_file
     f->base.pMethods = &s_esp_sqlite3_io_methods;
 
     if (out_flags != NULL) {
-        *out_flags = flags;
+        *out_flags = actual_flags;
     }
 
     ESP_SQLITE3_STAT_ADD(open_files, 1);
@@ -970,9 +1275,25 @@ static int esp_sqlite3_vfs_delete(sqlite3_vfs *vfs, const char *path, int sync_d
     (void)vfs;
     (void)sync_dir;
 
-    char full[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     if (esp_sqlite3_vfs_make_path(path, full, sizeof(full)) != ESP_OK) {
         return SQLITE_IOERR_DELETE;
+    }
+
+    size_t full_len = strlen(full);
+    if (full_len > 4 && strcmp(full + full_len - 4, "-wal") == 0) {
+        esp_sqlite3_vfs_lock_global();
+        char base[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
+        size_t base_len = full_len - 4;
+        if (base_len < sizeof(base)) {
+            memcpy(base, full, base_len);
+            base[base_len] = '\0';
+            if (esp_sqlite3_vfs_persist_wal_contains(base)) {
+                esp_sqlite3_vfs_unlock_global();
+                return SQLITE_OK;
+            }
+        }
+        esp_sqlite3_vfs_unlock_global();
     }
 
     if (unlink(full) != 0) {
@@ -993,9 +1314,9 @@ static int esp_sqlite3_vfs_access(sqlite3_vfs *vfs, const char *path, int flags,
     }
     *p_res_out = 0;
 
-    char full[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     if (esp_sqlite3_vfs_make_path(path, full, sizeof(full)) != ESP_OK) {
-        return SQLITE_OK;
+        return SQLITE_CANTOPEN;
     }
 
     struct stat st;
@@ -1005,11 +1326,17 @@ static int esp_sqlite3_vfs_access(sqlite3_vfs *vfs, const char *path, int flags,
     }
 
     /*
-     * 只要文件存在就返回 1。SPIFFS/FATFS 的 st_mode 并不总是可靠地反映
-     * 只读挂载；真正的写权限由后续 open(O_RDWR) 是否成功来判定。
+     * SPIFFS/FATFS 的 st_mode 不一定可靠；用 access() 判断实际权限。
+     * SQLite 会把 READWRITE 失败当成只读数据库处理，避免后续 xOpen
+     * 反复以读写模式失败。
      */
-    (void)flags;
-    *p_res_out = 1;
+    if (flags == SQLITE_ACCESS_READWRITE) {
+        *p_res_out = (access(full, R_OK | W_OK) == 0) ? 1 : 0;
+    } else if (flags == SQLITE_ACCESS_READ) {
+        *p_res_out = (access(full, R_OK) == 0) ? 1 : 0;
+    } else {
+        *p_res_out = 1;
+    }
     return SQLITE_OK;
 }
 
@@ -1020,7 +1347,7 @@ static int esp_sqlite3_vfs_full_pathname(sqlite3_vfs *vfs, const char *path, int
         return SQLITE_CANTOPEN;
     }
 
-    char full[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     if (esp_sqlite3_vfs_make_path(path, full, sizeof(full)) != ESP_OK) {
         return SQLITE_CANTOPEN;
     }
@@ -1185,6 +1512,16 @@ esp_err_t esp_sqlite3_vfs_register(bool make_default)
 {
     esp_sqlite3_vfs_mutex_init_once();
 
+    /*
+     * sqlite3_vfs_register() 内部会触发 sqlite3_initialize()。如果用户在
+     * esp_sqlite3_init() 之前调用本函数，MALLOC/MUTEX 还没配置，后续 init
+     * 会永久失败。初始化过程中由 sqlite3_os_init() 调用时放行。
+     */
+    if (!esp_sqlite3_is_initialized() && !esp_sqlite3_is_initializing()) {
+        ESP_SQLITE3_LOGE("esp_sqlite3_init() must be called before vfs_register()");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (s_registered) {
         return ESP_OK;
     }
@@ -1230,6 +1567,11 @@ void esp_sqlite3_vfs_reset_stats(void)
 
 int sqlite3_os_init(void)
 {
+    /*
+     * SQLite 在 sqlite3_initialize() 内回调这里。sqlite3_vfs_register()
+     * 会递归进入 sqlite3_initialize()，但 SQLite 用 inProgress 保护了这段；
+     * 前提是动态 mutex 不能使用 sqlite3_malloc（见 esp_sqlite3_mutex.c）。
+     */
     esp_err_t err = esp_sqlite3_vfs_register(true);
     return (err == ESP_OK) ? SQLITE_OK : SQLITE_ERROR;
 }

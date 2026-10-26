@@ -7,15 +7,15 @@
 
 ```c
 esp_err_t esp_sqlite3_init(void);
-void      esp_sqlite3_deinit(void);
+esp_err_t esp_sqlite3_deinit(void);
 bool      esp_sqlite3_is_initialized(void);
 const char *esp_sqlite3_version(void);
 void      esp_sqlite3_set_log_level(int level); // ESP_LOG_ERROR / WARN / INFO / DEBUG
 ```
 
 - `esp_sqlite3_init()` 幂等；必须在任何 SQLite API 之前调用。
-- `esp_sqlite3_deinit()` 前必须关闭所有连接；否则 `sqlite3_shutdown()` 返回 BUSY，
-  组件会保持 initialized 状态并打印警告。
+- `esp_sqlite3_deinit()` 前必须关闭所有连接；组件会检查连接计数，仍有连接时返回
+  `ESP_ERR_INVALID_STATE`，不会调用 `sqlite3_shutdown()`。
 - `esp_sqlite3_version()` 返回 `"3.54.1"` 这类字符串。
 
 ## 2. 配置与打开
@@ -30,7 +30,7 @@ typedef struct {
     bool create;
     bool uri;                     // 允许 file: URI
     uint32_t busy_timeout_ms;     // 默认 5000
-    uint32_t cache_size_kib;      // 0 = 编译默认（默认 64KiB）
+    uint32_t cache_size_kib;      // 0 = 编译默认（默认 16KiB）
     uint32_t page_size;           // 0 = 编译默认（默认 4096）
     esp_sqlite3_journal_mode_t journal_mode; // 默认 DEFAULT=保持现有模式
     esp_sqlite3_sync_mode_t synchronous;
@@ -49,7 +49,7 @@ typedef struct {
 void      esp_sqlite3_config_init(esp_sqlite3_config_t *cfg);
 esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_db);
 esp_err_t esp_sqlite3_open_simple(const char *path, esp_sqlite3_t **out_db);
-void      esp_sqlite3_close(esp_sqlite3_t *db);
+esp_err_t esp_sqlite3_close(esp_sqlite3_t *db);
 sqlite3  *esp_sqlite3_handle(esp_sqlite3_t *db);
 const char *esp_sqlite3_path(const esp_sqlite3_t *db);
 bool      esp_sqlite3_in_transaction(const esp_sqlite3_t *db);
@@ -397,6 +397,7 @@ esp_sqlite3_vacuum(db);
 ## 12. 生命周期与线程规则
 
 - `esp_sqlite3_t` 由 `esp_sqlite3_open()` 创建，`esp_sqlite3_close()` 释放；
+  如果仍有未 finalize 的语句，`close()` 返回 `ESP_ERR_INVALID_STATE`，需先清理语句再重试。
 - 关闭前必须 `sqlite3_finalize()` 所有语句；
 - 不要在多任务间同时使用同一个 `sqlite3_stmt`；
 - 多任务并发写：每个任务独立连接，依赖 VFS 文件锁 + `busy_timeout` 重试；
