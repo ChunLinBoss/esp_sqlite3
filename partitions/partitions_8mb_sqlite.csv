@@ -1,0 +1,26 @@
+# =============================================================================
+# esp_sqlite3 8MB Flash 推荐分区表
+#
+# 适用：板载 8MB Flash，主固件 + SQLite
+#
+# 布局：
+#   nvs       16KB
+#   otadata    8KB
+#   phy_init   4KB
+#   ota_0     2.5MB   app
+#   ota_1     2.5MB   app
+#   storage   ~2.9MB   SPIFFS（SQLite 数据库、离线缓存、日志）
+#
+# 说明：
+#   1. 2.5MB app 分区可容纳约 1.5MB 主固件 + SQLite（MAX 档约 587KB）；
+#   2. 若主固件较小，可把节约的空间分给 storage；
+#   3. 分区表变更不能通过 OTA 下发，必须 USB 全片烧录一次；
+#   4. 需要更大数据分区时，建议改用 16MB 布局。
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xD000,   0x2000,
+phy_init, data, phy,     0xF000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x280000,
+ota_1,    app,  ota_1,   0x290000, 0x280000,
+storage,  data, spiffs,  0x510000, 0x2F0000,

@@ -33,9 +33,9 @@ menu "ESP SQLite3（官方 SQLite 移植）"
                        ATTACH、VACUUM、ANALYZE、virtual table 代码仍保留。
 
             注意：ESP32-C5 当前分区表 ota_0/ota_1 各 1792KB，主固件已占
-            约 1536KB。即使 CRUD 档位链接后也约 1904KB，仍放不下；要在
-            主固件中链接 SQLite，需改用 16MB Flash 分区表
-            （见 docs/02-架构设计.md 的“Flash 预算”章节）。
+            约 1536KB。即使 CRUD 档位链接后也约 1904KB，仍放不下；并入
+            主固件建议使用 8MB 及以上 Flash（16MB 更宽裕），示例分区表
+            见 docs/02-架构设计.md 的“Flash 预算”章节。
         config ESP_SQLITE3_PROFILE_MAX
             bool "MAX（所有可选功能全开）"
         config ESP_SQLITE3_PROFILE_FULL

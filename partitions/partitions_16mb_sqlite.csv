@@ -1,0 +1,28 @@
+# =============================================================================
+# esp_sqlite3 16MB Flash 推荐分区表
+#
+# 适用：板载 16MB Flash，主固件 + SQLite + 较大数据分区
+#
+# 布局：
+#   nvs       16KB
+#   otadata    8KB
+#   phy_init   4KB
+#   ota_0       4MB   app
+#   ota_1       4MB   app
+#   storage     4MB   SPIFFS（SQLite 数据库、离线缓存、日志）
+#   剩余      ~4MB   保留
+#
+# 重要：
+#   1. 与旧 partitions.csv（双 1.75MB OTA）不兼容，分区偏移已改变；
+#   2. 分区表不能通过 OTA 下发，必须用 USB 重新烧录一次
+#      （idf.py erase-flash flash），之后 OTA 才能继续用；
+#   3. 切换方法：把本文件内容复制到 partitions.csv，或把
+#      CONFIG_PARTITION_TABLE_CUSTOM_FILENAME 改为本文件名。
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xD000,   0x2000,
+phy_init, data, phy,     0xF000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x400000,
+ota_1,    app,  ota_1,   0x410000, 0x400000,
+storage,  data, spiffs,  0x810000, 0x400000,

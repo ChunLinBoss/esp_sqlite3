@@ -16,8 +16,9 @@
 直接用 SQLite 官方 **3.54.1**，自己实现符合规范的 VFS/内存/互斥层；
 社区版的功能（SPIFFS/SD/FATFS、PSRAM、shox96）全部保留，并补齐
 WAL、外键、完整性检查、真实锁/日志/截断、JSON、FTS5、RTREE、备份、迁移；
-代价是 Flash 占用静态库 368~587KB（CRUD~MAX），主工程需要改用 16MB
-分区布局；最大/最小与五档实测见 [00-功能清单](00-功能清单.md) 第 9 节。
+代价是 Flash 占用静态库 368~587KB（CRUD~MAX）；并入主固件**建议 8MB
+及以上 Flash**，16MB 更宽裕；4MB 只适合独立自测固件。最大/最小与五档实测见
+[00-功能清单](00-功能清单.md) 第 9 节。
 
 > **均衡擦写**：SQLite 本身不做 WL，磨损均衡由底层文件系统提供——
 > SPIFFS 内建、FATFS 需 `wear_levelling`、LittleFS 内建。详见

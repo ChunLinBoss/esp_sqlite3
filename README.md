@@ -5,6 +5,8 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 适配层、内存/互斥实现、扩展函数和中文高层 API。
 
 - **当前功能清单**：[docs/00-功能清单.md](docs/00-功能清单.md)
+- **Flash 建议**：并入主固件建议 **8MB 及以上**，16MB 更宽裕；4MB 仅适合
+  独立自测固件。
 - **均衡擦写说明**：SQLite 本身不做 WL，由底层文件系统提供（SPIFFS 内建、
   FATFS 需 `wear_levelling`、LittleFS 内建），详见功能清单第 8 节。
 
@@ -13,14 +15,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlinboss/esp_sqlite3^0.1.0"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.1.1"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlinboss/esp_sqlite3: "^0.1.0"
+  chunlinboss/esp_sqlite3: "^0.1.1"
 ```
 
 ## 为什么重做
@@ -70,13 +72,14 @@ components/esp_sqlite3/
 │   ├── esp_sqlite3_selftest.c   # 内置自测（可选编译）
 │   ├── esp_sqlite3_force_ndebug.h # IDF5 assert 求值兼容
 │   └── shox96_0_2.c/.h         # 旧版兼容压缩算法（Apache-2.0）
+├── partitions/                 # 8MB / 16MB Flash 推荐分区表
 └── test_apps/selftest/         # 独立自测工程（4MB Flash + SPIFFS）
 ```
 
 ## 快速使用
 
-1. 把组件目录放到工程的 `components/` 下（本仓库已在
-   `FmC5Demo/components/esp_sqlite3`）。
+1. 把组件目录放到工程的 `components/esp_sqlite3` 下，或直接用
+   `idf.py add-dependency` 添加。
 2. 在 `main/CMakeLists.txt` 的 `REQUIRES` 中加入 `esp_sqlite3`。
 3. 在挂载好文件系统后初始化并打开数据库：
 
@@ -138,13 +141,17 @@ ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
 > 能力；视图、触发器、ALTER、ATTACH、VACUUM 等因预生成 parser 限制仍保留，
 > 详见 [`docs/00-功能清单.md`](docs/00-功能清单.md)。
 
-> **Flash 预算警告**：当前 `FmC5Demo/partitions.csv` 是 4MB 布局，
-> `ota_0/ota_1` 各 1792KB，主固件已约 1536KB。即使 CRUD 档位
-> （库约 368KB）链接后也约 1904KB，仍放不进现有 app 分区。若要在主固件中
-> 使用 SQLite，请改用
-> [`partitions_16mb_sqlite.csv`](../../partitions_16mb_sqlite.csv)
-> （16MB Flash，双 4MB OTA + 4MB 数据分区），并注意分区表变更**不能只靠 OTA
-> 下发**，需要 USB 重新烧录一次。详见
+> **Flash 建议**：组件本身可以在 4MB 自测工程中运行；**并入主固件建议使用
+> 8MB 及以上 Flash**，16MB 更宽裕。当前 4MB 布局的 `ota_0/ota_1` 各 1792KB，
+> 主固件已约 1536KB，即使 CRUD 档位（库约 368KB）链接后也约 1904KB，放不进
+> 现有 app 分区。
+>
+> - 8MB：[`partitions/partitions_8mb_sqlite.csv`](partitions/partitions_8mb_sqlite.csv)
+>   （双 2.5MB OTA + 约 2.9MB SPIFFS）
+> - 16MB：[`partitions/partitions_16mb_sqlite.csv`](partitions/partitions_16mb_sqlite.csv)
+>   （双 4MB OTA + 4MB SPIFFS）
+>
+> 分区表变更**不能只靠 OTA 下发**，需要 USB 全片烧录一次。详见
 > [`docs/02-架构设计.md`](docs/02-架构设计.md)。
 
 ## 兼容性

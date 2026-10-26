@@ -1,4 +1,4 @@
-version: "0.1.0"
+version: "0.1.1"
 description: "SQLite 3.54.1 for ESP-IDF: VFS, WAL, PSRAM, FTS5, RTREE, backup and migration"
 url: "https://github.com/ChunLinBoss/esp_sqlite3"
 repository: "https://github.com/ChunLinBoss/esp_sqlite3.git"
