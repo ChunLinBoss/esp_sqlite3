@@ -1,4 +1,4 @@
-version: "0.2.1"
+version: "0.2.2"
 description: "SQLite 3.54.1 for ESP-IDF: VFS, WAL, PSRAM, FTS5, RTREE, backup and migration"
 url: "https://github.com/ChunLinBoss/esp_sqlite3"
 repository: "https://github.com/ChunLinBoss/esp_sqlite3.git"
@@ -15,7 +15,16 @@ tags:
   - wal
 
 targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c2
+  - esp32c3
   - esp32c5
+  - esp32c6
+  - esp32c61
+  - esp32h2
+  - esp32p4
 
 dependencies:
   idf: ">=5.5"
