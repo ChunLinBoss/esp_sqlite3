@@ -16,9 +16,9 @@ menu "ESP SQLite3（官方 SQLite 移植）"
             SQLITE_OMIT_SHARED_CACHE，不再提供已废弃 API 与共享缓存。
             被移除的接口清单见 docs/00-功能清单.md。
 
-            MAX      : 在 FULL 基础上再打开 UTF-16、扩展加载、
-                       bytecode 虚表、normalize 等所有可选开关，
-                       用于测量“非废弃功能上限”，不推荐量产。
+            MAX      : 在 FULL 基础上再打开 UTF-16、bytecode 虚表、
+                       normalize 等所有可选开关，用于测量“非废弃功能上限”。
+                       ESP-IDF 无 dlopen，动态扩展加载始终关闭。
             FULL     : WAL + FTS5 + RTREE + STAT4 + DBSTAT + 数学函数，
                        功能最全。
             STANDARD : WAL + RTREE + DBSTAT + 数学函数，去掉 FTS5/STAT4，

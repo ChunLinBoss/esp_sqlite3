@@ -15,14 +15,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlinboss/esp_sqlite3^0.1.1"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.2.1"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlinboss/esp_sqlite3: "^0.1.1"
+  chunlinboss/esp_sqlite3: "^0.2.1"
 ```
 
 ## 为什么重做
@@ -112,7 +112,7 @@ esp_sqlite3_close(db);
 
 | 档位 | 功能概述 | 静态库体积* | 最小示例固件* |
 |------|----------|-------------|----------------|
-| MAX | 全部**未废弃**的可选功能（含 UTF-16、扩展加载、bytecode 虚表等） | **586.8 KB** | **836.3 KB** |
+| MAX | 全部**未废弃**的可选功能（含 UTF-16、bytecode 虚表等） | **586.8 KB** | **836.3 KB** |
 | FULL | WAL + FTS5 + RTREE + STAT4 + DBSTAT + 数学函数 | **569.9 KB** | **818.7 KB** |
 | STANDARD | WAL + RTREE + DBSTAT + 数学函数 | **470.6 KB** | **713.8 KB** |
 | MINIMAL | 核心 SQL + JSON，无 WAL/FTS5/RTREE/STAT4/DBSTAT/数学函数 | **432.4 KB** | **648.4 KB** |
@@ -120,7 +120,7 @@ esp_sqlite3_close(db);
 
 \* 同一最小示例固件（SPIFFS + 一次 CRUD smoke，**不含自测代码**），
 ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
-保留一位小数；静态 RAM 约 5.8~9.3KB，运行时页缓存默认 64KB/连接。
+保留一位小数；静态 RAM 约 5.8~9.3KB，运行时页缓存默认 16KB/连接。
 
 调试构建（IDF Debug / `-Og`）的最大值：
 
