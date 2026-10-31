@@ -86,16 +86,32 @@ static void esp_sqlite3_shox96_compress(sqlite3_context *context, int argc, sqli
         sqlite3_result_error_nomem(context);
         return;
     }
+    if (n_in < 0 || n_in > INT_MAX - 1100) {
+        sqlite3_result_error(context, "shox96 input too large", -1);
+        return;
+    }
+    /*
+     * 该格式没有二进制转义：0x00-0x1F、0x7F-0xFF 会被编码器丢弃，
+     * 造成“压缩成功但无法还原”。中文/UTF-8 文本也属于此列，必须在入口拒绝。
+     */
+    for (int i = 0; i < n_in; i++) {
+        unsigned char c = in[i];
+        if (!((c >= 0x20 && c <= 0x7E) || c == '\t' || c == '\n' || c == '\r')) {
+            sqlite3_result_error(context, "shox96 only supports printable ASCII", -1);
+            return;
+        }
+    }
 
     uint8_t varint[10];
     int varint_len = esp_sqlite3_encode_unsigned_varint(varint, (uint64_t)n_in);
 
-    /* 与旧版一致的上界：13 + len + len/1000，再预留 varint 长度 */
-    if (n_in < 0 || n_in > INT_MAX - 64) {
+    /* 最坏约 13 bit/字节，按 2 倍输入 + 余量预留，避免静默压缩失败 */
+    int64_t out_cap64 = (int64_t)n_in * 2 + varint_len + 64;
+    if (out_cap64 > INT_MAX) {
         sqlite3_result_error(context, "shox96 input too large", -1);
         return;
     }
-    int out_cap = 13 + n_in + (n_in + 999) / 1000 + varint_len;
+    int out_cap = (int)out_cap64;
     unsigned char *out = sqlite3_malloc64((sqlite3_uint64)out_cap);
     if (out == NULL) {
         sqlite3_result_error_nomem(context);

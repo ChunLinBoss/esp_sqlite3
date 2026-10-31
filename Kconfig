@@ -87,12 +87,13 @@ menu "ESP SQLite3（官方 SQLite 移植）"
 
     config ESP_SQLITE3_CACHE_KIB
         int "默认页缓存大小（KiB）"
-        range 8 1024
+        range 4 1024
         default 16
         help
             SQLITE_DEFAULT_CACHE_SIZE 的绝对值（KiB）。
             每打开一个连接都会占用这么多内存（实际按页分配）。
-            无 PSRAM 的 ESP32-C5/C6 建议 8~16KiB；带 PSRAM 可 32~128KiB。
+            无 PSRAM 且库很小可用 4~8KiB；普通设备建议 8~16KiB；
+            带 PSRAM 可 32~128KiB。
 
     config ESP_SQLITE3_LOOKASIDE
         bool "启用 Lookaside 小对象缓存"

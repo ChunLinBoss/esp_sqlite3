@@ -196,6 +196,11 @@ IDF 默认 `-Werror=all`。官方 `sqlite3.c` 和 shox96 会触发一些风格�
 - [x] `xLock/xUnlock` 实现 SHARED/RESERVED/PENDING/EXCLUSIVE；
 - [x] `xCheckReservedLock` 不把自己的 RESERVED 算作冲突；
 - [x] `xFileControl` 处理 `TEMPFILENAME/VFSNAME/HAS_MOVED/PERSIST_WAL`；
+- [x] `PERSIST_WAL` 使用动态表，不设固定数据库数量上限；
+- [x] 路径按目录项解析真实大小写，兼容 FATFS 的大小写不敏感；
+- [x] `xClose` 即使 SQLite 未调用 `xShmUnmap` 也释放本文件的 WAL shm 锁；
+- [x] `open(NULL)` 生成唯一临时文件；
+- [x] `sqlite3_os_init()` 允许用户先直接调用 `sqlite3_initialize()`；
 - [x] `xSectorSize` 返回 2 的幂；
 - [x] `xDeviceCharacteristics` 保守返回 0；
 - [x] WAL：`xShmMap/xShmLock/xShmBarrier/xShmUnmap`；
@@ -234,6 +239,10 @@ $env:IDF_PYTHON_ENV_PATH='C:\Espressif\tools\python\v5.5.4\venv'
 $env:ESP_IDF_VERSION='5.5.4'
 $env:PATH="C:\Espressif\tools\riscv32-esp-elf\esp-14.2.0_20260121\riscv32-esp-elf\bin;" + ...
 ```
+
+> IDF 5.5.4 的 FULL / MINIMAL 已在 ESP32-C5 烧录运行并通过自测。
+> 切换 IDF 版本后建议删除 `sdkconfig` 和 `build/` 再 `set-target esp32c5`，
+> 避免 CMake 缓存指向旧工具链。
 
 ### 6.3 烧录与运行
 

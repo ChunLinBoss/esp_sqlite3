@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "shox96_0_2.h"
 
@@ -42,7 +43,11 @@ byte lookup[65536];
 #define NICE_LEN_FOR_PRIOR 7
 #define NICE_LEN_FOR_OTHER 12
 
-#define SHX_ERR (-1000000)
+#define SHX_ERR INT_MIN
+#define SHX_MAX_COUNT 70307
+#define SHX_MAX_MATCH 70314
+#define SHX_MAX_DIST  70307
+#define SHX_MAX_LINE_MATCH (SHX_MAX_COUNT + NICE_LEN_FOR_OTHER)
 
 unsigned int mask[] = {0x8000, 0xC000, 0xE000, 0xF000, 0xF800, 0xFC00, 0xFE00, 0xFF00};
 int append_bits(char *out, int out_cap, int ol, unsigned int code, int clen, byte state) {
@@ -109,17 +114,25 @@ int encodeCount(char *out, int out_cap, int ol, int count) {
 
 int matchOccurance(const char *in, int len, int l, char *out, int out_cap, int *ol) {
   int j, k;
-  for (j = 0; j < l; j++) {
+  int j_start = l - SHX_MAX_DIST - 6;
+  if (j_start < 0) {
+    j_start = 0;
+  }
+  for (j = j_start; j < l; j++) {
     for (k = j; k < l && (l + k - j) < len; k++) {
       if (in[k] != in[l + k - j])
         break;
     }
-    if ((k - j) > (NICE_LEN_FOR_PRIOR - 1)) {
+    int match_len = k - j;
+    if (match_len > SHX_MAX_MATCH) {
+      match_len = SHX_MAX_MATCH;
+    }
+    if (match_len > (NICE_LEN_FOR_PRIOR - 1)) {
       *ol = append_bits(out, out_cap, *ol, 14144, 10, 1);
       if (*ol < 0) {
         return SHX_ERR;
       }
-      *ol = encodeCount(out, out_cap, *ol, k - j - NICE_LEN_FOR_PRIOR); // len
+      *ol = encodeCount(out, out_cap, *ol, match_len - NICE_LEN_FOR_PRIOR); // len
       if (*ol < 0) {
         return SHX_ERR;
       }
@@ -127,7 +140,7 @@ int matchOccurance(const char *in, int len, int l, char *out, int out_cap, int *
       if (*ol < 0) {
         return SHX_ERR;
       }
-      l += (k - j);
+      l += match_len;
       l--;
       return l;
     }
@@ -161,7 +174,14 @@ int matchLine(const char *in, int len, int l, char *out, int out_cap, int *ol, s
             continue;
           *ol = last_ol;
         }
-        last_len = (k - j);
+        int new_len = (k - j);
+        if (new_len > SHX_MAX_LINE_MATCH) {
+          new_len = SHX_MAX_LINE_MATCH;
+        }
+        if (j > SHX_MAX_COUNT || line_ctr > SHX_MAX_COUNT) {
+          continue;
+        }
+        last_len = new_len;
         last_dist = j;
         last_ctx = line_ctr;
         *ol = append_bits(out, out_cap, *ol, 14080, 10, 1);
@@ -228,6 +248,9 @@ int shox96_0_2_compress(const char *in, int len, char *out, int out_cap,
         while (rpt_count < len && in[rpt_count] == c_in)
           rpt_count++;
         rpt_count -= l;
+        if (rpt_count > SHX_MAX_COUNT + 4) {
+          rpt_count = SHX_MAX_COUNT + 4;
+        }
         ol = append_bits(out, out_cap, ol, 14208, 10, 1);
         if (ol < 0) {
           return -1;
@@ -348,6 +371,9 @@ int shox96_0_2_compress(const char *in, int len, char *out, int out_cap,
     } else
     if (c_in == '\t') {
       ol = append_bits(out, out_cap, ol, 9216, 7, state);
+    } else {
+      /* 格式没有二进制转义：直接 API 也不能静默丢弃不可编码字节 */
+      return -1;
     }
     if (ol < 0) {
       return -1;
@@ -563,10 +589,14 @@ int shox96_0_2_decompress(const char *in, int len, char *out, int out_cap,
                  return -1;
                }
                dist += NICE_LEN_FOR_PRIOR - 1;
-               if (dist > ol || dict_len > out_cap - ol) {
+               if (dist <= 0 || dist > ol || dict_len > out_cap - ol) {
                  return -1;
                }
-               memmove(out + ol, out + ol - dist, (size_t)dict_len);
+               /* 逐字节复制，支持 dist < dict_len 的 LZ 重叠，
+                  避免 memmove 读取尚未写入的输出缓冲区。 */
+               for (int i = 0; i < dict_len; i++) {
+                 out[ol + i] = out[ol - dist + i];
+               }
                ol += dict_len;
              } else {
                int dict_len = readCount(in, &bit_no, len_bits);

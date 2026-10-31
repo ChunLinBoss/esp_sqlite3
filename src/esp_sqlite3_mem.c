@@ -13,6 +13,7 @@
  *   - 大对象（页缓存、排序缓冲、WAL 索引）优先 PSRAM；
  *   - PSRAM 不足或未启用时自动回退内部 RAM，保证功能不受影响。
  */
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -118,6 +119,12 @@ static int esp_sqlite3_size(void *p)
 /** SQLite 要求按 8 字节对齐 */
 static int esp_sqlite3_roundup(int n)
 {
+    if (n <= 0) {
+        return 8;
+    }
+    if (n > INT_MAX - 7) {
+        return INT_MAX;
+    }
     return (n + 7) & ~7;
 }
 
@@ -158,7 +165,13 @@ esp_err_t esp_sqlite3_mem_register(void)
     int rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &s_esp_sqlite3_mem_methods);
     if (rc != SQLITE_OK) {
         /* 最常见原因：在注册前已经调用过 sqlite3_initialize()/sqlite3_open() */
-        ESP_SQLITE3_LOGE("register mem methods failed: rc=%d (%s)", rc, sqlite3_errstr(rc));
+        if (rc == SQLITE_MISUSE) {
+            ESP_LOGW(ESP_SQLITE3_TAG,
+                     "memory allocator already configured (SQLite initialized externally)");
+        } else {
+            ESP_SQLITE3_LOGE("register mem methods failed: rc=%d (%s)", rc,
+                            sqlite3_errstr(rc));
+        }
         return ESP_ERR_INVALID_STATE;
     }
 

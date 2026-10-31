@@ -15,14 +15,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlinboss/esp_sqlite3^0.2.2"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.3.0"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlinboss/esp_sqlite3: "^0.2.2"
+  chunlinboss/esp_sqlite3: "^0.3.0"
 ```
 
 ## 为什么重做
@@ -156,13 +156,32 @@ ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
 
 ## 兼容性
 
-- ESP-IDF **v5.5.4**：编译通过（GCC 14.2，ESP32-C5）。
+- ESP-IDF **v5.5.4**：FULL / MINIMAL 已在 ESP32-C5 上烧录运行，自测 PASS
+  （GCC 14.2）。
 - ESP-IDF **v6.1**：编译通过（GCC 15.2，ESP32-C5）；MAX / FULL / STANDARD /
   MINIMAL / CRUD 五档已在 C5 开发板逐档烧录，自测全部 PASS。
 - 目标芯片：ESP32-C5（RISC-V）；代码不使用 Xtensa 专用指令，ESP32/S3/C3/C6
   等同样适用。
 - 文件系统：任何实现了 POSIX `open/read/write/lseek/close/ftruncate/fsync/
   stat/unlink` 的 ESP-IDF VFS 挂载点，如 SPIFFS、FATFS、LittleFS、SD 卡。
+  同一路径的不同大小写写法会按目录项中的真实名称归一化（FATFS 必需），
+  SPIFFS/LittleFS 上不存在的错误大小写仍会正常返回 `CANTOPEN`。
+
+### 0.3.0 可靠性行为
+
+- **外部初始化**：即使应用先调用了 `sqlite3_initialize()`，`esp_sqlite3_init()`
+  也会检测并用自定义分配器/FreeRTOS 互斥量重新初始化；存在外部连接时
+  shutdown 返回 BUSY，不会强行破坏。
+- **WAL 降级保护**：编译时没有 WAL 的固件打开 WAL 主库会返回
+  `ESP_ERR_NOT_SUPPORTED`，不会读到未回放的旧数据。
+- **PERSIST_WAL**：持久 WAL 标记使用动态表，不再受固定 4 个数据库限制。
+- **临时库目录**：即使编译默认 `temp_store=MEMORY`，运行时设置
+  `temp_store_memory=false` 也会使用 `CONFIG_ESP_SQLITE3_TEMP_DIR`。
+- **长操作**：VACUUM / VACUUM INTO / 在线备份会周期性让出 CPU 并喂任务
+  看门狗；备份仍分块执行，BUSY 重试上限约 1 秒。
+- **VFS 边界**：SPIFFS 稀疏写、越过 EOF 的短读、路径 `NULL` 临时文件、
+  关闭时清理 WAL shm 锁、deinit/reinit 均已加入自测；相对路径不允许用
+  `..` 跳出 `CONFIG_ESP_SQLITE3_DEFAULT_DIR`。
 
 ## 自测
 
@@ -174,7 +193,10 @@ idf.py build flash monitor
 
 自测覆盖：建表、事务批量写入、UPDATE/DELETE、JSON、FTS5、RTREE、
 shox96 往返、完整性检查、VACUUM、在线备份、user_version 迁移、WAL checkpoint、
-内存统计。期望串口最后输出：
+内存统计；0.3.0 额外覆盖外部 `sqlite3_initialize` 恢复、WAL 降级拒绝、
+SPIFFS 稀疏写/短路读、`path=NULL` 临时文件、大小写路径、运行时
+`temp_store=FILE`、损坏库、双任务并发写、PERSIST_WAL x6、deinit/reinit。
+期望串口最后输出：
 
 ```
 I (...) esp_sqlite3_test: ===== esp_sqlite3 selftest PASSED =====
@@ -189,6 +211,7 @@ I (...) selftest_main: SELFTEST RESULT: PASS
 - [API 参考](docs/03-API参考.md)
 - [移植与 IDF 适配](docs/04-移植与IDF适配.md)
 - [测试与性能](docs/05-测试与性能.md)
+- [变更记录](CHANGELOG.md)
 
 ## 许可证
 

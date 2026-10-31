@@ -54,12 +54,24 @@ void esp_sqlite3_vfs_get_stats(esp_sqlite3_vfs_stats_t *out);
 void esp_sqlite3_vfs_reset_stats(void);
 
 /**
+ * @brief 清理 VFS 内部的锁/WAL 共享内存表
+ *
+ * 只有在没有打开文件时才能成功；deinit 会调用它。
+ * 用于文件系统卸载/重挂载后清理陈旧状态。
+ */
+esp_err_t esp_sqlite3_vfs_reset(void);
+
+/**
  * @brief 把相对路径补全为绝对路径
  *
  * 规则：
  *  - 以 '/' 开头：原样复制；
  *  - ":memory:"：原样复制；
- *  - 其他：拼到 Kconfig 的 ESP_SQLITE3_DEFAULT_DIR 后面。
+ *  - 其他：拼到 Kconfig 的 ESP_SQLITE3_DEFAULT_DIR 后面；规范化后若跳出
+ *    该目录（如 "../x"）返回 ESP_ERR_INVALID_ARG。
+ *
+ * 已存在的路径分量会按目录项真实大小写归一化（FATFS 必需）；
+ * SPIFFS/LittleFS 上不存在的大小写写法仍按原样返回。
  *
  * @return ESP_OK / ESP_ERR_INVALID_ARG / ESP_ERR_INVALID_SIZE
  */

@@ -99,6 +99,10 @@ static int esp_sqlite3_mutex_end(void)
 
 static sqlite3_mutex *esp_sqlite3_mutex_alloc(int id)
 {
+    if (!s_mutex_initialized) {
+        return NULL;
+    }
+
     if (id >= ESP_SQLITE3_STATIC_MUTEX_MIN && id <= ESP_SQLITE3_STATIC_MUTEX_MAX) {
         return (sqlite3_mutex *)&s_static_mutexes[id];
     }

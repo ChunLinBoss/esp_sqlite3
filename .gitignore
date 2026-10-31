@@ -7,6 +7,10 @@ managed_components/
 dependencies.lock
 dist/
 
+# local test logs/binaries
+test_apps/*.log
+test_apps/*.exe
+
 # IDE / OS
 .vscode/
 .idea/

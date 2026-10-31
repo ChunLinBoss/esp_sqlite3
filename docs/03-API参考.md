@@ -70,6 +70,19 @@ PRAGMA query_only = ON;                 -- 只读或 query_only
 
 `PRAGMA page_size` 对已存在的数据库只影响后续 `VACUUM`，不会改变当前页大小。
 
+`temp_store=FILE`（`cfg.temp_store_memory=false`）时，临时库目录始终使用
+`CONFIG_ESP_SQLITE3_TEMP_DIR`，即使编译默认是 `SQLITE_TEMP_STORE=3`（内存）。
+这样运行时切换临时存储不会落到 VFS 当前目录。
+
+相对路径会拼到 `CONFIG_ESP_SQLITE3_DEFAULT_DIR`；如果规范化后跳出该目录
+（例如 `../other.db`），`esp_sqlite3_vfs_make_path()` 返回
+`ESP_ERR_INVALID_ARG`，VFS 打开返回 `CANTOPEN`。绝对路径不受此限制。
+
+若应用在 `esp_sqlite3_init()` 之前直接调用了 `sqlite3_initialize()`，
+`esp_sqlite3_init()` 会检测到并先 `sqlite3_shutdown()`，再重新安装 ESP-IDF
+分配器/FreeRTOS 互斥量；若此时仍有外部连接，shutdown 返回 BUSY，初始化
+返回错误而不是强行关闭连接。
+
 ### 2.3 枚举
 
 ```c
@@ -219,11 +232,17 @@ esp_err_t esp_sqlite3_set_busy_timeout(esp_sqlite3_t *db, uint32_t ms);
 esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out);
 ```
 
-- `integrity_check`：第一行结果不是 `"ok"` 时返回 `ESP_FAIL`，结果写入 `out`。
-- `vacuum`：需要约等于数据库大小的空闲空间。
-- `vacuum_into`：SQLite 3.27+，生成一致性副本。
-- `wal_checkpoint`：`mode` 取 `SQLITE_CHECKPOINT_PASSIVE/FULL/RESTART/TRUNCATE`。
-- `backup`：在线备份，分块 `sqlite3_backup_step(128)`，BUSY 重试约 1 秒。
+- `integrity_check`：第一行结果不是 `"ok"` 时返回 `ESP_FAIL`，结果写入 `out`；
+  CRUD 档位编译了 `SQLITE_OMIT_INTEGRITY_CHECK` 时返回
+  `ESP_ERR_NOT_SUPPORTED`。
+- `vacuum`：需要约等于数据库大小的空闲空间；执行期间会周期性让出 CPU
+  并喂任务看门狗（CRUD 档位未编译 progress callback，无法内建让出）。
+- `vacuum_into`：SQLite 3.27+，生成一致性副本；长操作处理同 `vacuum`。
+- `wal_checkpoint`：`mode` 取 `SQLITE_CHECKPOINT_PASSIVE/FULL/RESTART/TRUNCATE`；
+  无 WAL 的档位返回 `ESP_ERR_NOT_SUPPORTED`。
+- `backup`：在线备份，分块 `sqlite3_backup_step(128)`，BUSY 重试约 1 秒；
+  源路径必须存在，源/目标规范化后相同会返回 `ESP_ERR_INVALID_ARG`，
+  每步之间会喂任务看门狗并周期性让出 CPU。
 - `get_size`：`page_count * page_size`（不含 WAL 中未 checkpoint 的页）。
 
 ### 6.1 内存统计

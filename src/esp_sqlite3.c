@@ -15,9 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -107,6 +110,21 @@ static const char *esp_sqlite3_journal_mode_name(esp_sqlite3_journal_mode_t mode
     }
 }
 
+static int esp_sqlite3_prepare_retry(sqlite3 *db, const char *sql, int sql_len,
+                                     sqlite3_stmt **stmt, const char **tail)
+{
+    int rc = sqlite3_prepare_v2(db, sql, sql_len, stmt, tail);
+    if (rc == SQLITE_NOMEM) {
+        ESP_SQLITE3_LOGW("prepare NOMEM, release db memory and retry");
+        (void)sqlite3_db_release_memory(db);
+        if (stmt != NULL) {
+            *stmt = NULL;
+        }
+        rc = sqlite3_prepare_v2(db, sql, sql_len, stmt, tail);
+    }
+    return rc;
+}
+
 /** 执行可选 PRAGMA：失败只告警，不影响打开（不同文件系统支持度不同） */
 static void esp_sqlite3_apply_pragma(sqlite3 *db, const char *sql)
 {
@@ -144,7 +162,7 @@ static esp_err_t esp_sqlite3_pragma_text(sqlite3 *db, const char *sql,
     out[0] = '\0';
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db, rc, sql);
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -171,7 +189,7 @@ static esp_err_t esp_sqlite3_pragma_int(sqlite3 *db, const char *sql, int64_t *o
         return ESP_ERR_INVALID_ARG;
     }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db, rc, sql);
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -264,6 +282,22 @@ esp_err_t esp_sqlite3_init(void)
 
     /* 顺序非常重要：MALLOC/MUTEX/LOG 都必须在 sqlite3_initialize() 之前配置 */
     esp_err_t err = esp_sqlite3_mem_register();
+    if (err == ESP_ERR_INVALID_STATE) {
+        /*
+         * 用户可能在 esp_sqlite3_init() 之前直接调用了 sqlite3_initialize()。
+         * 此时 SQLite 已用默认分配器/NOOP 互斥量完成初始化，必须 shutdown
+         * 后重新配置；如果还有外部连接存在，shutdown 会返回 BUSY，保持原错误。
+         */
+        ESP_LOGW(ESP_SQLITE3_TAG,
+                 "SQLite was initialized externally; resetting runtime configuration");
+        int shutdown_rc = sqlite3_shutdown();
+        if (shutdown_rc == SQLITE_OK) {
+            (void)esp_sqlite3_vfs_reset();
+            err = esp_sqlite3_mem_register();
+        } else {
+            ESP_SQLITE3_LOGE("sqlite3_shutdown after external init failed: rc=%d", shutdown_rc);
+        }
+    }
     if (err != ESP_OK) {
         s_state = ESP_SQLITE3_STATE_UNINIT;
         xSemaphoreGiveRecursive(lock);
@@ -300,15 +334,18 @@ esp_err_t esp_sqlite3_init(void)
         return err;
     }
 
-    /* 临时文件目录（仅当编译为 temp_store=FILE 时需要） */
-#if !CONFIG_ESP_SQLITE3_TEMP_STORE_MEMORY
-    if (sqlite3_temp_directory == NULL) {
+    /*
+     * 临时文件目录必须始终设置，不能只在编译默认 temp_store=FILE 时设置：
+     * 运行时可传 cfg.temp_store_memory=false 并执行 PRAGMA temp_store=FILE，
+     * 此时若 sqlite3_temp_directory==NULL，临时库会落到 VFS 当前目录，
+     * 在 SPIFFS 上通常直接 CANTOPEN。
+     */
+    if (sqlite3_temp_directory == NULL && CONFIG_ESP_SQLITE3_TEMP_DIR[0] != '\0') {
         sqlite3_temp_directory = sqlite3_mprintf("%s", CONFIG_ESP_SQLITE3_TEMP_DIR);
         if (sqlite3_temp_directory == NULL) {
             ESP_SQLITE3_LOGW("set temp directory failed (out of memory)");
         }
     }
-#endif
 
     err = esp_sqlite3_ext_register();
     if (err != ESP_OK) {
@@ -353,6 +390,14 @@ esp_err_t esp_sqlite3_deinit(void)
         xSemaphoreGiveRecursive(lock);
         return ESP_ERR_INVALID_STATE;
     }
+    esp_sqlite3_vfs_stats_t vfs_stats;
+    esp_sqlite3_vfs_get_stats(&vfs_stats);
+    if (vfs_stats.open_files != 0) {
+        ESP_SQLITE3_LOGE("deinit refused: %u VFS file(s) still open",
+                        (unsigned)vfs_stats.open_files);
+        xSemaphoreGiveRecursive(lock);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     esp_sqlite3_ext_unregister();
 
@@ -363,6 +408,9 @@ esp_err_t esp_sqlite3_deinit(void)
         return esp_sqlite3_rc_to_esp_err(rc);
     }
     s_state = ESP_SQLITE3_STATE_UNINIT;
+    if (esp_sqlite3_vfs_reset() != ESP_OK) {
+        ESP_SQLITE3_LOGW("VFS reset failed after shutdown");
+    }
     xSemaphoreGiveRecursive(lock);
     return ESP_OK;
 }
@@ -513,7 +561,37 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
 
     /* 扩展错误码：sqlite3_extended_errcode() 才有意义 */
     sqlite3_extended_result_codes(wrapper->db, 1);
-    sqlite3_busy_timeout(wrapper->db, (int)cfg->busy_timeout_ms);
+    int busy_timeout = (cfg->busy_timeout_ms > (uint32_t)INT32_MAX)
+                           ? INT32_MAX : (int)cfg->busy_timeout_ms;
+    sqlite3_busy_timeout(wrapper->db, busy_timeout);
+
+    /* VFS 可能在写保护介质上把 READWRITE 降级为 O_RDONLY。 */
+    if (sqlite3_db_readonly(wrapper->db, "main") == 1) {
+        if (!wrapper->read_only) {
+            ESP_SQLITE3_LOGW("database opened read-only by filesystem: %s", cfg->path);
+        }
+        wrapper->read_only = true;
+    }
+
+#ifdef SQLITE_OMIT_WAL
+    /* OMIT_WAL 固件打开 WAL 主库时不会回放 -wal，必须拒绝而不是读到旧数据 */
+    if (!cfg->uri && cfg->journal_mode != ESP_SQLITE3_JOURNAL_WAL) {
+        char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
+        if (esp_sqlite3_vfs_make_path(cfg->path, full, sizeof(full)) == ESP_OK) {
+            int probe = open(full, O_RDONLY);
+            if (probe >= 0) {
+                uint8_t hdr[20];
+                ssize_t n = read(probe, hdr, sizeof(hdr));
+                close(probe);
+                if (n >= 20 && hdr[18] == 2 && hdr[19] == 2) {
+                    ESP_SQLITE3_LOGE("database is in WAL mode but this build has SQLITE_OMIT_WAL");
+                    esp_sqlite3_abort_open(wrapper);
+                    return ESP_ERR_NOT_SUPPORTED;
+                }
+            }
+        }
+    }
+#endif
 
     /* ---- 连接级 PRAGMA -------------------------------------------------- */
     if (cfg->cache_size_kib > 0) {
@@ -529,7 +607,7 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
         esp_sqlite3_apply_pragma(wrapper->db, sql);
     }
 
-    if (!cfg->read_only && cfg->journal_mode != ESP_SQLITE3_JOURNAL_DEFAULT) {
+    if (!wrapper->read_only && cfg->journal_mode != ESP_SQLITE3_JOURNAL_DEFAULT) {
         char sql[64];
         snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;",
                  esp_sqlite3_journal_mode_name(cfg->journal_mode));
@@ -591,7 +669,7 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
                     ? "PRAGMA temp_store=MEMORY;"
                     : "PRAGMA temp_store=FILE;");
 
-    if (cfg->exclusive_locking && !cfg->read_only) {
+    if (cfg->exclusive_locking && !wrapper->read_only) {
         esp_sqlite3_apply_pragma(wrapper->db, "PRAGMA locking_mode=EXCLUSIVE;");
     }
 
@@ -613,7 +691,7 @@ esp_err_t esp_sqlite3_open(const esp_sqlite3_config_t *cfg, esp_sqlite3_t **out_
 
     const char *journal_name = esp_sqlite3_journal_mode_name(cfg->journal_mode);
     ESP_SQLITE3_LOGI("opened %s (read_only=%d, journal=%s, sync=%d, cache=%luKiB)",
-                    cfg->path, cfg->read_only,
+                    cfg->path, wrapper->read_only,
                     journal_name != NULL ? journal_name : "keep",
                     (int)cfg->synchronous, (unsigned long)cfg->cache_size_kib);
 
@@ -639,7 +717,9 @@ esp_err_t esp_sqlite3_close(esp_sqlite3_t *db)
         int rc = sqlite3_close(db->db);
         if (rc != SQLITE_OK) {
             esp_sqlite3_log_error(db->db, rc, "sqlite3_close");
-            return esp_sqlite3_rc_to_esp_err(rc);
+            /* close 的 BUSY 是“还有未 finalize 语句”，不是超时 */
+            return (rc == SQLITE_BUSY) ? ESP_ERR_INVALID_STATE
+                                       : esp_sqlite3_rc_to_esp_err(rc);
         }
         db->db = NULL;
         esp_sqlite3_connection_end();
@@ -681,8 +761,8 @@ esp_err_t esp_sqlite3_exec(esp_sqlite3_t *db, const char *sql)
     char *errmsg = NULL;
     int rc = sqlite3_exec(db->db, sql, NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-        ESP_SQLITE3_LOGE("exec failed: rc=%d msg=%s sql=%s", rc,
-                        errmsg != NULL ? errmsg : sqlite3_errmsg(db->db), sql);
+        ESP_SQLITE3_LOGE("exec failed: rc=%d msg=%s", rc,
+                        errmsg != NULL ? errmsg : sqlite3_errmsg(db->db));
     }
     sqlite3_free(errmsg);
     return esp_sqlite3_rc_to_esp_err(rc);
@@ -714,7 +794,7 @@ esp_err_t esp_sqlite3_query(esp_sqlite3_t *db, const char *sql,
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(db->db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db->db, rc, "prepare(query)");
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -750,7 +830,7 @@ esp_err_t esp_sqlite3_query_int64(esp_sqlite3_t *db, const char *sql, int64_t *o
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(int64)");
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -783,7 +863,7 @@ esp_err_t esp_sqlite3_query_double(esp_sqlite3_t *db, const char *sql, double *o
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(double)");
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -817,7 +897,7 @@ esp_err_t esp_sqlite3_query_text(esp_sqlite3_t *db, const char *sql,
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
+    int rc = esp_sqlite3_prepare_retry(esp_sqlite3_handle(db), sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(text)");
         return esp_sqlite3_rc_to_esp_err(rc);
@@ -826,21 +906,25 @@ esp_err_t esp_sqlite3_query_text(esp_sqlite3_t *db, const char *sql,
     esp_err_t result;
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        const unsigned char *text = sqlite3_column_text(stmt, 0);
-        if (text == NULL) {
+        if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
             if (buf != NULL && buf_len > 0) {
                 buf[0] = '\0';
             }
             result = ESP_OK;
         } else {
-            size_t len = strlen((const char *)text);
-            if (buf == NULL) {
-                result = ESP_OK;
-            } else if (len + 1 > buf_len) {
-                result = ESP_ERR_INVALID_SIZE;
+            const unsigned char *text = sqlite3_column_text(stmt, 0);
+            if (text == NULL) {
+                result = ESP_ERR_NO_MEM;
             } else {
-                memcpy(buf, text, len + 1);
-                result = ESP_OK;
+                size_t len = strlen((const char *)text);
+                if (buf == NULL) {
+                    result = ESP_OK;
+                } else if (len + 1 > buf_len) {
+                    result = ESP_ERR_INVALID_SIZE;
+                } else {
+                    memcpy(buf, text, len + 1);
+                    result = ESP_OK;
+                }
             }
         }
     } else if (rc == SQLITE_DONE) {
@@ -871,9 +955,26 @@ esp_err_t esp_sqlite3_prepare_v2(esp_sqlite3_t *db, const char *sql, int sql_len
     }
 
     int rc = sqlite3_prepare_v2(db->db, sql, sql_len, stmt, tail);
+    if (rc == SQLITE_NOMEM) {
+        /*
+         * 小内存设备常见：连接还能用，但页缓存/空闲块碎片化导致编译语句
+         * 拿不到内存。先释放本连接可回收的页缓存，再原地重试一次；这是
+         * 安全的，因为 prepare 失败不会改变数据库内容。
+         */
+        ESP_LOGW(ESP_SQLITE3_TAG, "prepare NOMEM, release db memory and retry");
+        (void)sqlite3_db_release_memory(db->db);
+        if (stmt != NULL) {
+            *stmt = NULL;
+        }
+        rc = sqlite3_prepare_v2(db->db, sql, sql_len, stmt, tail);
+    }
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db->db, rc, "sqlite3_prepare_v2");
         return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    if (*stmt == NULL) {
+        /* 纯空白/注释 SQL：SQLite 返回 OK 但不产生语句 */
+        return ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;
 }
@@ -893,6 +994,9 @@ esp_err_t esp_sqlite3_reset(sqlite3_stmt *stmt)
 
 esp_err_t esp_sqlite3_clear_bindings(sqlite3_stmt *stmt)
 {
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     return esp_sqlite3_rc_to_esp_err(sqlite3_clear_bindings(stmt));
 }
 
@@ -940,11 +1044,17 @@ esp_err_t esp_sqlite3_column_text_copy(sqlite3_stmt *stmt, int col,
     if (stmt == NULL || buf == NULL || buf_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (col < 0 || col >= sqlite3_column_count(stmt)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sqlite3_column_type(stmt, col) == SQLITE_NULL) {
+        buf[0] = '\0';
+        return ESP_OK;
+    }
 
     const unsigned char *text = sqlite3_column_text(stmt, col);
     if (text == NULL) {
-        buf[0] = '\0';
-        return ESP_OK;
+        return ESP_ERR_NO_MEM;
     }
 
     size_t len = strlen((const char *)text);
@@ -1050,6 +1160,11 @@ esp_err_t esp_sqlite3_integrity_check(esp_sqlite3_t *db, bool quick,
     };
 
     const char *sql = quick ? "PRAGMA quick_check;" : "PRAGMA integrity_check;";
+#ifdef SQLITE_OMIT_INTEGRITY_CHECK
+    (void)sql;
+    ESP_SQLITE3_LOGW("integrity_check is not compiled in this profile");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     char *errmsg = NULL;
     int rc = sqlite3_exec(db->db, sql, esp_sqlite3_integrity_cb, &ctx, &errmsg);
     if (rc != SQLITE_OK) {
@@ -1058,6 +1173,7 @@ esp_err_t esp_sqlite3_integrity_check(esp_sqlite3_t *db, bool quick,
         return esp_sqlite3_rc_to_esp_err(rc);
     }
     sqlite3_free(errmsg);
+#endif
 
     if (out != NULL && out_len > 0) {
         snprintf(out, out_len, "%s", local_buf);
@@ -1071,9 +1187,47 @@ esp_err_t esp_sqlite3_integrity_check(esp_sqlite3_t *db, bool quick,
     return ESP_OK;
 }
 
+/** 当前任务未订阅 TWDT 时，esp_task_wdt_reset() 会打印错误，先查询状态 */
+static inline void esp_sqlite3_wdt_feed(void)
+{
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+        (void)esp_task_wdt_reset();
+    }
+}
+
+/** VACUUM 等长操作的进度回调：喂任务看门狗并周期性让出 CPU */
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+static int esp_sqlite3_long_op_progress(void *arg)
+{
+    uint32_t *count = (uint32_t *)arg;
+    if (count != NULL) {
+        (*count)++;
+        if ((*count & 0x3F) == 0) {
+            vTaskDelay(1);
+        }
+    }
+    esp_sqlite3_wdt_feed();
+    return 0;
+}
+#endif
+
+static esp_err_t esp_sqlite3_exec_long(esp_sqlite3_t *db, const char *sql)
+{
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+    if (db != NULL && db->db != NULL) {
+        uint32_t progress = 0;
+        sqlite3_progress_handler(db->db, 1000, esp_sqlite3_long_op_progress, &progress);
+        esp_err_t err = esp_sqlite3_exec(db, sql);
+        sqlite3_progress_handler(db->db, 0, NULL, NULL);
+        return err;
+    }
+#endif
+    return esp_sqlite3_exec(db, sql);
+}
+
 esp_err_t esp_sqlite3_vacuum(esp_sqlite3_t *db)
 {
-    return esp_sqlite3_exec(db, "VACUUM;");
+    return esp_sqlite3_exec_long(db, "VACUUM;");
 }
 
 esp_err_t esp_sqlite3_vacuum_into(esp_sqlite3_t *db, const char *dest_path)
@@ -1083,7 +1237,7 @@ esp_err_t esp_sqlite3_vacuum_into(esp_sqlite3_t *db, const char *dest_path)
     }
 
     /* VACUUM INTO 的目标路径由 SQLite 直接交给 xOpen，先按 VFS 规则补全 */
-    char full[CONFIG_ESP_SQLITE3_MAX_PATH];
+    char full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
     esp_err_t path_err = esp_sqlite3_vfs_make_path(dest_path, full, sizeof(full));
     if (path_err != ESP_OK) {
         return path_err;
@@ -1093,7 +1247,7 @@ esp_err_t esp_sqlite3_vacuum_into(esp_sqlite3_t *db, const char *dest_path)
     if (sql == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    esp_err_t err = esp_sqlite3_exec(db, sql);
+    esp_err_t err = esp_sqlite3_exec_long(db, sql);
     sqlite3_free(sql);
     return err;
 }
@@ -1105,6 +1259,16 @@ esp_err_t esp_sqlite3_wal_checkpoint(esp_sqlite3_t *db, int mode,
         return ESP_ERR_INVALID_ARG;
     }
 
+#ifdef SQLITE_OMIT_WAL
+    (void)mode;
+    if (log_frames != NULL) {
+        *log_frames = 0;
+    }
+    if (checkpointed_frames != NULL) {
+        *checkpointed_frames = 0;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     int log_n = 0;
     int ckpt_n = 0;
     int rc = sqlite3_wal_checkpoint_v2(db->db, NULL, mode, &log_n, &ckpt_n);
@@ -1118,6 +1282,7 @@ esp_err_t esp_sqlite3_wal_checkpoint(esp_sqlite3_t *db, int mode,
         esp_sqlite3_log_error(db->db, rc, "wal_checkpoint");
     }
     return esp_sqlite3_rc_to_esp_err(rc);
+#endif
 }
 
 esp_err_t esp_sqlite3_optimize(esp_sqlite3_t *db)
@@ -1135,7 +1300,18 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
     if (src_path == NULL || dst_path == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (strcmp(src_path, dst_path) == 0) {
+
+    char src_full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
+    char dst_full[CONFIG_ESP_SQLITE3_MAX_PATH + 16];
+    esp_err_t path_err = esp_sqlite3_vfs_make_path(src_path, src_full, sizeof(src_full));
+    if (path_err != ESP_OK) {
+        return path_err;
+    }
+    path_err = esp_sqlite3_vfs_make_path(dst_path, dst_full, sizeof(dst_full));
+    if (path_err != ESP_OK) {
+        return path_err;
+    }
+    if (strcmp(src_full, dst_full) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1145,7 +1321,7 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
     /* 源库必须存在：create=false，避免把拼错的路径当成空库备份出去 */
     esp_sqlite3_config_t src_cfg;
     esp_sqlite3_config_init(&src_cfg);
-    src_cfg.path = src_path;
+    src_cfg.path = src_full;
     src_cfg.create = false;
     /*
      * 备份会同时打开源/目标两个连接。ESP32-C5 等无 PSRAM 的型号内部
@@ -1161,7 +1337,7 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
 
     esp_sqlite3_config_t dst_cfg;
     esp_sqlite3_config_init(&dst_cfg);
-    dst_cfg.path = dst_path;
+    dst_cfg.path = dst_full;
     dst_cfg.cache_size_kib = 8;
     dst_cfg.temp_store_memory = false;
     err = esp_sqlite3_open(&dst_cfg, &dst);
@@ -1173,22 +1349,25 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
     sqlite3_backup *backup = sqlite3_backup_init(esp_sqlite3_handle(dst), "main",
                                                  esp_sqlite3_handle(src), "main");
     if (backup == NULL) {
-        esp_sqlite3_log_error(esp_sqlite3_handle(dst), sqlite3_errcode(esp_sqlite3_handle(dst)),
-                             "sqlite3_backup_init");
+        int init_rc = sqlite3_errcode(esp_sqlite3_handle(dst));
+        esp_sqlite3_log_error(esp_sqlite3_handle(dst), init_rc, "sqlite3_backup_init");
         esp_sqlite3_close(dst);
         esp_sqlite3_close(src);
-        return ESP_FAIL;
+        return esp_sqlite3_rc_to_esp_err(init_rc);
     }
 
     int rc;
     int retries = 0;
+    unsigned steps = 0;
     do {
+        /* 大库备份可能持续数秒：每步喂狗，周期性让 IDLE 任务运行 */
+        esp_sqlite3_wdt_feed();
+        if ((steps++ & 0x07) == 0) {
+            vTaskDelay(1);
+        }
         rc = sqlite3_backup_step(backup, 128);  /* 分块，避免长时间占用 CPU */
-        if (rc == SQLITE_OK) {
-            retries = 0;
-            taskYIELD();
-        } else if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-            /* 最多重试约 1 秒，避免在 BUSY 上无限自旋 */
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            /* 累计最多重试约 1 秒，不能因为中途成功几次就无限延长 */
             if (++retries > 100) {
                 break;
             }
@@ -1205,8 +1384,17 @@ esp_err_t esp_sqlite3_backup(const char *src_path, const char *dst_path)
         esp_sqlite3_log_error(esp_sqlite3_handle(dst), rc, "sqlite3_backup");
     }
 
-    esp_sqlite3_close(dst);
-    esp_sqlite3_close(src);
+    esp_err_t close_dst_err = esp_sqlite3_close(dst);
+    esp_err_t close_src_err = esp_sqlite3_close(src);
+    if (rc == SQLITE_DONE || rc == SQLITE_OK) {
+        if (close_dst_err != ESP_OK) {
+            return close_dst_err;
+        }
+        if (close_src_err != ESP_OK) {
+            return close_src_err;
+        }
+        return ESP_OK;
+    }
     return esp_sqlite3_rc_to_esp_err(rc);
 }
 
@@ -1259,7 +1447,7 @@ esp_err_t esp_sqlite3_table_exists(esp_sqlite3_t *db, const char *table, bool *e
 
     *exists = false;
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->db,
+    int rc = esp_sqlite3_prepare_retry(db->db,
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 COLLATE NOCASE LIMIT 1;",
         -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -1267,7 +1455,12 @@ esp_err_t esp_sqlite3_table_exists(esp_sqlite3_t *db, const char *table, bool *e
         return esp_sqlite3_rc_to_esp_err(rc);
     }
 
-    sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        esp_sqlite3_log_error(db->db, rc, "bind(table_exists)");
+        sqlite3_finalize(stmt);
+        return esp_sqlite3_rc_to_esp_err(rc);
+    }
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         *exists = true;
@@ -1287,7 +1480,8 @@ esp_err_t esp_sqlite3_set_busy_timeout(esp_sqlite3_t *db, uint32_t ms)
     if (db == NULL || db->db == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    return esp_sqlite3_rc_to_esp_err(sqlite3_busy_timeout(db->db, (int)ms));
+    int timeout = (ms > (uint32_t)INT32_MAX) ? INT32_MAX : (int)ms;
+    return esp_sqlite3_rc_to_esp_err(sqlite3_busy_timeout(db->db, timeout));
 }
 
 esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out)
@@ -1298,6 +1492,9 @@ esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out)
 
     memset(out, 0, sizeof(*out));
 
+#if !defined(SQLITE_DEFAULT_MEMSTATUS) || !SQLITE_DEFAULT_MEMSTATUS
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     int64_t current = 0;
     int64_t high = 0;
     sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &current, &high, 0);
@@ -1314,6 +1511,7 @@ esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out)
     sqlite3_status64(SQLITE_STATUS_MALLOC_COUNT, &current, &high, 0);
     out->malloc_count = current;
     return ESP_OK;
+#endif
 }
 
 esp_err_t esp_sqlite3_migrate(esp_sqlite3_t *db,
@@ -1321,6 +1519,19 @@ esp_err_t esp_sqlite3_migrate(esp_sqlite3_t *db,
 {
     if (db == NULL || (steps == NULL && count > 0)) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    int prev_version = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (steps[i].version <= 0 || steps[i].version <= prev_version) {
+            ESP_SQLITE3_LOGE("migration steps must have strictly increasing positive versions");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (steps[i].sql == NULL) {
+            ESP_SQLITE3_LOGE("migration step %d has NULL SQL", steps[i].version);
+            return ESP_ERR_INVALID_ARG;
+        }
+        prev_version = steps[i].version;
     }
 
     int current = 0;
