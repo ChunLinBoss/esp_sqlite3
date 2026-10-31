@@ -956,6 +956,8 @@ static int esp_sqlite3_vfs_lock(sqlite3_file *id, int level)
             rc = SQLITE_BUSY;
         } else if (lock->reserved != NULL && lock->reserved != file) {
             rc = SQLITE_BUSY;
+        } else if (lock->exclusive != NULL && lock->exclusive != file) {
+            rc = SQLITE_BUSY;
         } else {
             lock->pending = file;
         }
@@ -971,6 +973,8 @@ static int esp_sqlite3_vfs_lock(sqlite3_file *id, int level)
         } else if (lock->exclusive != NULL && lock->exclusive != file) {
             rc = SQLITE_BUSY;
         } else if (lock->reserved != NULL && lock->reserved != file) {
+            rc = SQLITE_BUSY;
+        } else if (lock->pending != NULL && lock->pending != file) {
             rc = SQLITE_BUSY;
         } else {
             lock->exclusive = file;
@@ -1041,9 +1045,19 @@ static int esp_sqlite3_vfs_check_reserved_lock(sqlite3_file *id, int *p_reserved
     }
 
     esp_sqlite3_vfs_lock_global();
-    /* 与 POSIX 语义保持一致：自己持有的 RESERVED 不算“别人持有” */
-    *p_reserved = (file->lock != NULL && file->lock->reserved != NULL &&
-                   file->lock->reserved != file) ? 1 : 0;
+    /*
+     * 与 POSIX 语义保持一致：自己持有的锁不算“别人持有”。
+     * RESERVED/PENDING/EXCLUSIVE 任意一种存在都说明有写者。
+     */
+    *p_reserved = 0;
+    if (file->lock != NULL) {
+        esp_sqlite3_vfs_lock_t *lock = file->lock;
+        if ((lock->reserved != NULL && lock->reserved != file) ||
+            (lock->pending != NULL && lock->pending != file) ||
+            (lock->exclusive != NULL && lock->exclusive != file)) {
+            *p_reserved = 1;
+        }
+    }
     esp_sqlite3_vfs_unlock_global();
     return SQLITE_OK;
 }

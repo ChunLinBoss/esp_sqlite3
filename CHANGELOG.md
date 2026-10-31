@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1
+
+### 修复
+
+- `esp_sqlite3_query()` / `query_int64()` / `query_double()` / `query_text()`
+  对纯空白/注释 SQL 的 `stmt == NULL` 增加检查，避免对 NULL 语句调用
+  `sqlite3_step()` 导致崩溃。
+- VFS 锁状态机：`PENDING` 也要拒绝其他连接的 `EXCLUSIVE`；`EXCLUSIVE` 也要
+  拒绝其他连接的 `PENDING`；`xCheckReservedLock()` 现在把
+  RESERVED/PENDING/EXCLUSIVE 任一状态都计为写者。
+- `esp_sqlite3_state_mutex` 改为静态创建，避免在 `portENTER_CRITICAL` 内做
+  可能走堆分配的动态信号量创建。
+
+### 验证
+
+- ESP-IDF 6.1 / ESP32-C5 FULL：`SELFTEST RESULT: PASS`（含空 SQL 查询与
+  双任务并发写回归）。
+
 ## 0.3.0
 
 ### 修复

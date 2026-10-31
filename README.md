@@ -15,14 +15,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlinboss/esp_sqlite3^0.3.0"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.3.1"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlinboss/esp_sqlite3: "^0.3.0"
+  chunlinboss/esp_sqlite3: "^0.3.1"
 ```
 
 ## 为什么重做
@@ -167,7 +167,7 @@ ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
   同一路径的不同大小写写法会按目录项中的真实名称归一化（FATFS 必需），
   SPIFFS/LittleFS 上不存在的错误大小写仍会正常返回 `CANTOPEN`。
 
-### 0.3.0 可靠性行为
+### 0.3.x 可靠性行为
 
 - **外部初始化**：即使应用先调用了 `sqlite3_initialize()`，`esp_sqlite3_init()`
   也会检测并用自定义分配器/FreeRTOS 互斥量重新初始化；存在外部连接时
@@ -193,7 +193,7 @@ idf.py build flash monitor
 
 自测覆盖：建表、事务批量写入、UPDATE/DELETE、JSON、FTS5、RTREE、
 shox96 往返、完整性检查、VACUUM、在线备份、user_version 迁移、WAL checkpoint、
-内存统计；0.3.0 额外覆盖外部 `sqlite3_initialize` 恢复、WAL 降级拒绝、
+内存统计；0.3.x 额外覆盖外部 `sqlite3_initialize` 恢复、WAL 降级拒绝、
 SPIFFS 稀疏写/短路读、`path=NULL` 临时文件、大小写路径、运行时
 `temp_store=FILE`、损坏库、双任务并发写、PERSIST_WAL x6、deinit/reinit。
 期望串口最后输出：

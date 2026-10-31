@@ -420,6 +420,22 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
         TEST_CHECK(esp_sqlite3_clear_bindings(NULL) == ESP_ERR_INVALID_ARG,
                    "clear_bindings(NULL) not rejected");
 
+        /* query 系列对纯空白/注释 SQL 也必须返回错误，不能对 NULL stmt step */
+        {
+            int64_t dummy_i64 = 0;
+            double dummy_d = 0;
+            char dummy_t[8];
+            TEST_CHECK(esp_sqlite3_query(db, " -- empty\n", NULL, NULL) ==
+                       ESP_ERR_INVALID_ARG, "empty query SQL not rejected");
+            TEST_CHECK(esp_sqlite3_query_int64(db, " -- empty\n", &dummy_i64) ==
+                       ESP_ERR_INVALID_ARG, "empty query_int64 SQL not rejected");
+            TEST_CHECK(esp_sqlite3_query_double(db, " -- empty\n", &dummy_d) ==
+                       ESP_ERR_INVALID_ARG, "empty query_double SQL not rejected");
+            TEST_CHECK(esp_sqlite3_query_text(db, " -- empty\n", dummy_t,
+                                              sizeof(dummy_t)) ==
+                       ESP_ERR_INVALID_ARG, "empty query_text SQL not rejected");
+        }
+
         /* 非法迁移顺序必须在执行任何 SQL 前被拒绝 */
         static const esp_sqlite3_migration_t bad_steps[] = {
             { 2, "CREATE TABLE bad_order(x);" },

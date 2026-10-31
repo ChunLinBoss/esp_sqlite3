@@ -49,6 +49,7 @@ typedef enum {
 
 static volatile esp_sqlite3_state_t s_state = ESP_SQLITE3_STATE_UNINIT;
 static int s_open_connections = 0;
+static StaticSemaphore_t s_state_mutex_buf;
 static SemaphoreHandle_t s_state_mutex = NULL;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -57,7 +58,8 @@ static SemaphoreHandle_t esp_sqlite3_state_mutex_get(void)
     if (s_state_mutex == NULL) {
         portENTER_CRITICAL(&s_state_mux);
         if (s_state_mutex == NULL) {
-            s_state_mutex = xSemaphoreCreateRecursiveMutex();
+            /* 静态创建：临界区内不能调用可能走堆分配的动态创建 */
+            s_state_mutex = xSemaphoreCreateRecursiveMutexStatic(&s_state_mutex_buf);
         }
         portEXIT_CRITICAL(&s_state_mux);
     }
@@ -167,6 +169,9 @@ static esp_err_t esp_sqlite3_pragma_text(sqlite3 *db, const char *sql,
         esp_sqlite3_log_error(db, rc, sql);
         return esp_sqlite3_rc_to_esp_err(rc);
     }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         const unsigned char *text = sqlite3_column_text(stmt, 0);
@@ -193,6 +198,9 @@ static esp_err_t esp_sqlite3_pragma_int(sqlite3 *db, const char *sql, int64_t *o
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db, rc, sql);
         return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
@@ -799,6 +807,9 @@ esp_err_t esp_sqlite3_query(esp_sqlite3_t *db, const char *sql,
         esp_sqlite3_log_error(db->db, rc, "prepare(query)");
         return esp_sqlite3_rc_to_esp_err(rc);
     }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     esp_err_t result = ESP_OK;
     int row = 0;
@@ -835,6 +846,9 @@ esp_err_t esp_sqlite3_query_int64(esp_sqlite3_t *db, const char *sql, int64_t *o
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(int64)");
         return esp_sqlite3_rc_to_esp_err(rc);
     }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     esp_err_t result;
     rc = sqlite3_step(stmt);
@@ -867,6 +881,9 @@ esp_err_t esp_sqlite3_query_double(esp_sqlite3_t *db, const char *sql, double *o
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(double)");
         return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     esp_err_t result;
@@ -901,6 +918,9 @@ esp_err_t esp_sqlite3_query_text(esp_sqlite3_t *db, const char *sql,
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(esp_sqlite3_handle(db), rc, "prepare(text)");
         return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     esp_err_t result;
@@ -1453,6 +1473,9 @@ esp_err_t esp_sqlite3_table_exists(esp_sqlite3_t *db, const char *table, bool *e
     if (rc != SQLITE_OK) {
         esp_sqlite3_log_error(db->db, rc, "prepare(table_exists)");
         return esp_sqlite3_rc_to_esp_err(rc);
+    }
+    if (stmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     rc = sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
