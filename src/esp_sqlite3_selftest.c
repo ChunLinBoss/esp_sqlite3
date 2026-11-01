@@ -113,6 +113,17 @@ static void test_remove_db(const char *path)
     remove(buf);
 }
 
+#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK)
+static int test_progress_cb(void *ctx)
+{
+    int *calls = (int *)ctx;
+    if (calls != NULL) {
+        (*calls)++;
+    }
+    return 0;
+}
+#endif
+
 static esp_err_t test_query_int64(esp_sqlite3_t *db, const char *sql, int64_t expected)
 {
     int64_t value = 0;
@@ -359,7 +370,21 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
         int64_t free_after = 0;
         TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA freelist_count;", &free_before));
         TEST_CHECK(free_before > 0, "freelist_count before VACUUM is 0");
+#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK)
+        int progress_calls = 0;
+        TEST_STEP(esp_sqlite3_set_progress_handler(db, 1, test_progress_cb,
+                                                   &progress_calls));
         TEST_STEP(esp_sqlite3_vacuum(db));
+        int calls_after_vacuum = progress_calls;
+        TEST_CHECK(calls_after_vacuum > 0, "VACUUM did not invoke progress handler");
+        TEST_STEP(test_query_int64(db, "SELECT COUNT(*) FROM t;", 99));
+        TEST_CHECK(progress_calls > calls_after_vacuum,
+                   "progress handler was not restored after VACUUM");
+        TEST_STEP(esp_sqlite3_set_progress_handler(db, 0, NULL, NULL));
+        ESP_LOGI(TEST_TAG, "progress handler: ok (%d calls)", progress_calls);
+#else
+        TEST_STEP(esp_sqlite3_vacuum(db));
+#endif
         TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA freelist_count;", &free_after));
         TEST_CHECK(free_after < free_before, "VACUUM did not reduce freelist: %lld -> %lld",
                    (long long)free_before, (long long)free_after);
@@ -402,8 +427,37 @@ esp_err_t esp_sqlite3_run_selftest(const char *db_path)
         TEST_CHECK(ckpt_frames == log_frames,
                    "WAL checkpoint incomplete: log=%d ckpt=%d", log_frames, ckpt_frames);
         ESP_LOGI(TEST_TAG, "wal_checkpoint: log=%d ckpt=%d", log_frames, ckpt_frames);
+
+        /* 只读连接打开活动 WAL 库并尝试写入，必须可读且写入被拒绝 */
+        esp_sqlite3_config_t ro_cfg;
+        esp_sqlite3_config_init(&ro_cfg);
+        ro_cfg.path = db_path;
+        ro_cfg.read_only = true;
+        ro_cfg.create = false;
+        esp_sqlite3_t *ro_db = NULL;
+        TEST_STEP(esp_sqlite3_open(&ro_cfg, &ro_db));
+        TEST_STEP(test_query_int64(ro_db, "SELECT COUNT(*) FROM t;", 99));
+        esp_err_t ro_write = esp_sqlite3_exec(ro_db,
+            "INSERT INTO t(name,value,ts,payload) VALUES('ro',0,0,NULL);");
+        TEST_CHECK(ro_write != ESP_OK, "read-only WAL connection accepted a write");
+        TEST_STEP(esp_sqlite3_close(ro_db));
+        ESP_LOGI(TEST_TAG, "read-only WAL: ok (write rejected: %s)",
+                 esp_err_to_name(ro_write));
     }
 #endif
+
+    /* ---- 12b. mmap 必须被编译期关闭 -------------------------------- */
+    {
+        int64_t mmap_size = -1;
+        TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA mmap_size;", &mmap_size));
+        TEST_CHECK(mmap_size == 0, "mmap_size=%lld, expected 0",
+                   (long long)mmap_size);
+        TEST_STEP(esp_sqlite3_exec(db, "PRAGMA mmap_size=65536;"));
+        TEST_STEP(esp_sqlite3_query_int64(db, "PRAGMA mmap_size;", &mmap_size));
+        TEST_CHECK(mmap_size == 0, "mmap_size changed to %lld despite SQLITE_MAX_MMAP_SIZE=0",
+                   (long long)mmap_size);
+        ESP_LOGI(TEST_TAG, "mmap: disabled (size=0)");
+    }
 
     /* ---- 13. 边界 API 与泄漏回归 --------------------------------------- */
     {

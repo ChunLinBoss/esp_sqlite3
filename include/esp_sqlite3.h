@@ -147,6 +147,14 @@ typedef esp_err_t (*esp_sqlite3_row_cb_t)(void *ctx, sqlite3_stmt *stmt, int row
 /** 事务回调：返回 ESP_OK 提交，其他值回滚 */
 typedef esp_err_t (*esp_sqlite3_txn_cb_t)(void *ctx);
 
+/**
+ * @brief SQLite progress callback
+ *
+ * 返回 0 继续执行；返回非 0 中止当前 SQL（SQLite 会返回 SQLITE_ABORT）。
+ * 回调在 SQLite 执行 VDBE 指令时被调用，不能阻塞过久。
+ */
+typedef int (*esp_sqlite3_progress_cb_t)(void *ctx);
+
 /** 数据库迁移步骤 */
 typedef struct {
     int version;        /**< 执行完 sql 后写入 PRAGMA user_version 的值 */
@@ -372,6 +380,23 @@ esp_err_t esp_sqlite3_table_exists(esp_sqlite3_t *db, const char *table, bool *e
 
 /** @brief 设置 busy timeout */
 esp_err_t esp_sqlite3_set_busy_timeout(esp_sqlite3_t *db, uint32_t ms);
+
+/**
+ * @brief 设置业务 progress handler（推荐方式）
+ *
+ * 与直接调用 sqlite3_progress_handler() 不同，本接口注册的是组件内部的
+ * 链式 trampoline：VACUUM / VACUUM INTO 等长操作会复用该 handler，并在
+ * 每次回调中喂任务看门狗，结束后不会把业务 handler 清掉。
+ *
+ * @param n_ops 每执行多少条 VDBE 指令回调一次；<=0 或 cb==NULL 表示取消
+ * @param cb 回调；返回非 0 中止 SQL
+ * @param ctx 用户上下文
+ *
+ * @note CRUD 档位定义了 SQLITE_OMIT_PROGRESS_CALLBACK，此时返回
+ *       ESP_ERR_NOT_SUPPORTED。
+ */
+esp_err_t esp_sqlite3_set_progress_handler(esp_sqlite3_t *db, int n_ops,
+                                           esp_sqlite3_progress_cb_t cb, void *ctx);
 
 /** @brief 获取 SQLite 内存统计 */
 esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out);

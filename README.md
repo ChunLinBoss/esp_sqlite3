@@ -15,14 +15,14 @@ amalgamation（`sqlite3.c` 3.54.1，SHA3 已校验），在其上实现完整的
 从 ESP Component Registry 添加：
 
 ```bash
-idf.py add-dependency "chunlinboss/esp_sqlite3^0.3.1"
+idf.py add-dependency "chunlinboss/esp_sqlite3^0.3.2"
 ```
 
 或在项目 `main/idf_component.yml` 中声明：
 
 ```yaml
 dependencies:
-  chunlinboss/esp_sqlite3: "^0.3.1"
+  chunlinboss/esp_sqlite3: "^0.3.2"
 ```
 
 ## 为什么重做
@@ -167,6 +167,15 @@ ESP-IDF 6.1、`-Os`、ESP32-C5；shox96 始终包含。1 KB = 1024 B，
   同一路径的不同大小写写法会按目录项中的真实名称归一化（FATFS 必需），
   SPIFFS/LittleFS 上不存在的错误大小写仍会正常返回 `CANTOPEN`。
 
+### 边界与限制
+
+- **只读 WAL**：同一进程存在活动写连接并建立 WAL shm 索引时，只读连接可以
+  附着读取；如果进程重启后只剩一个未 checkpoint 的 WAL 且没有任何 shm，
+  只读连接无法初始化索引，需要先由可写连接恢复/ checkpoint。
+- **mmap**：组件固定 `SQLITE_MAX_MMAP_SIZE=0`，`PRAGMA mmap_size` 始终为 0。
+- **多进程文件锁**：ESP-IDF 是单进程环境，VFS 锁是进程内状态机；多进程
+  语义不适用。多任务并发写已通过自测。
+
 ### 0.3.x 可靠性行为
 
 - **外部初始化**：即使应用先调用了 `sqlite3_initialize()`，`esp_sqlite3_init()`
@@ -191,11 +200,27 @@ idf.py set-target esp32c5
 idf.py build flash monitor
 ```
 
+## 压力 / 掉电 / 磁盘满 / 只读测试
+
+```powershell
+cd components/esp_sqlite3/test_apps/stress
+idf.py set-target esp32c5
+idf.py erase-flash
+idf.py flash monitor
+```
+
+`stress` 工程会连续 8 次在写事务进行中复位，每次启动校验 `integrity_check`
+和批次完整性；随后填满 SPIFFS 验证 `SQLITE_FULL` 恢复、用只读 VFS 挂载验证
+`EROFS` 降级、验证 mmap 关闭，以及业务 progress handler 在 VACUUM 后仍有效。
+期望最后一行是 `STRESS RESULT: PASS`。真实拔电需外部继电器；`esp_restart()`
+覆盖了写入过程中的硬件复位恢复路径。
+
 自测覆盖：建表、事务批量写入、UPDATE/DELETE、JSON、FTS5、RTREE、
 shox96 往返、完整性检查、VACUUM、在线备份、user_version 迁移、WAL checkpoint、
 内存统计；0.3.x 额外覆盖外部 `sqlite3_initialize` 恢复、WAL 降级拒绝、
 SPIFFS 稀疏写/短路读、`path=NULL` 临时文件、大小写路径、运行时
-`temp_store=FILE`、损坏库、双任务并发写、PERSIST_WAL x6、deinit/reinit。
+`temp_store=FILE`、损坏库、双任务并发写、PERSIST_WAL x6、deinit/reinit；
+以及只读 WAL、mmap=0、业务 progress handler 在 VACUUM 后保活。
 期望串口最后输出：
 
 ```

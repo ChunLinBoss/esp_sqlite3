@@ -1167,18 +1167,30 @@ static int esp_sqlite3_vfs_shm_map(sqlite3_file *id, int iPg, int pgsz, int bExt
     }
     *pp = NULL;
 
-    if ((file->open_flags & SQLITE_OPEN_READONLY) &&
-        (file->shm == NULL || bExtend)) {
+    bool read_only = (file->open_flags & SQLITE_OPEN_READONLY) != 0;
+    if (read_only && bExtend) {
         return SQLITE_READONLY_CANTINIT;
     }
 
     esp_sqlite3_vfs_lock_global();
 
     if (file->shm == NULL) {
-        file->shm = esp_sqlite3_shm_get(file->path);
+        if (read_only) {
+            /*
+             * 只读连接不能初始化/扩展 shm，但同进程已有写连接时可以直接
+             * 附着到它的 WAL 索引；否则 SQLite 会尝试写 WAL 恢复并得到
+             * disk I/O error。
+             */
+            file->shm = esp_sqlite3_shm_find(file->path);
+            if (file->shm != NULL) {
+                file->shm->n_ref++;
+            }
+        } else {
+            file->shm = esp_sqlite3_shm_get(file->path);
+        }
         if (file->shm == NULL) {
             esp_sqlite3_vfs_unlock_global();
-            return SQLITE_NOMEM;
+            return read_only ? SQLITE_READONLY_CANTINIT : SQLITE_NOMEM;
         }
     }
 

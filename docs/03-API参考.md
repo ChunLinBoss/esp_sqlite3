@@ -229,14 +229,17 @@ esp_err_t esp_sqlite3_get_user_version(esp_sqlite3_t *db, int *version);
 esp_err_t esp_sqlite3_set_user_version(esp_sqlite3_t *db, int version);
 esp_err_t esp_sqlite3_table_exists(esp_sqlite3_t *db, const char *table, bool *exists);
 esp_err_t esp_sqlite3_set_busy_timeout(esp_sqlite3_t *db, uint32_t ms);
+esp_err_t esp_sqlite3_set_progress_handler(esp_sqlite3_t *db, int n_ops,
+                                           esp_sqlite3_progress_cb_t cb, void *ctx);
 esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out);
 ```
 
 - `integrity_check`：第一行结果不是 `"ok"` 时返回 `ESP_FAIL`，结果写入 `out`；
   CRUD 档位编译了 `SQLITE_OMIT_INTEGRITY_CHECK` 时返回
   `ESP_ERR_NOT_SUPPORTED`。
-- `vacuum`：需要约等于数据库大小的空闲空间；执行期间会周期性让出 CPU
-  并喂任务看门狗（CRUD 档位未编译 progress callback，无法内建让出）。
+- `vacuum`：需要约等于数据库大小的空闲空间；执行期间会链式调用
+  `esp_sqlite3_set_progress_handler()` 注册的业务 callback，并周期性让出 CPU、
+  喂任务看门狗（CRUD 档位未编译 progress callback，无法内建让出）。
 - `vacuum_into`：SQLite 3.27+，生成一致性副本；长操作处理同 `vacuum`。
 - `wal_checkpoint`：`mode` 取 `SQLITE_CHECKPOINT_PASSIVE/FULL/RESTART/TRUNCATE`；
   无 WAL 的档位返回 `ESP_ERR_NOT_SUPPORTED`。
@@ -244,6 +247,26 @@ esp_err_t esp_sqlite3_get_mem_stats(esp_sqlite3_mem_stats_t *out);
   源路径必须存在，源/目标规范化后相同会返回 `ESP_ERR_INVALID_ARG`，
   每步之间会喂任务看门狗并周期性让出 CPU。
 - `get_size`：`page_count * page_size`（不含 WAL 中未 checkpoint 的页）。
+
+#### 6.0 progress handler
+
+直接调用 `sqlite3_progress_handler()` 会被 VACUUM 内部的看门狗链覆盖。
+需要业务 progress callback 时请使用：
+
+```c
+static int on_progress(void *ctx) {
+    (*(int *)ctx)++;
+    return 0; // 非 0 中止 SQL
+}
+
+ESP_ERROR_CHECK(esp_sqlite3_set_progress_handler(db, 1000, on_progress, &counter));
+ESP_ERROR_CHECK(esp_sqlite3_vacuum(db));
+ESP_ERROR_CHECK(esp_sqlite3_set_progress_handler(db, 0, NULL, NULL));
+```
+
+组件内部 trampoline 会在每次回调中调用业务 callback，然后喂任务看门狗；
+VACUUM 结束后会恢复业务 handler，而不是清空。CRUD 档位没有
+`SQLITE_OMIT_PROGRESS_CALLBACK` 支持，设置时返回 `ESP_ERR_NOT_SUPPORTED`。
 
 ### 6.1 内存统计
 

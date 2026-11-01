@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.2
+
+### 新增
+
+- 新增 `esp_sqlite3_set_progress_handler()`：业务 progress handler 通过内部
+  trampoline 链接，`VACUUM` / `VACUUM INTO` / 在线备份等长操作复用业务步长，
+  并在回调中喂任务看门狗、周期性让出 CPU；长操作结束后恢复业务 handler。
+- 新增 `test_apps/stress` 压力工程：掉电重启、磁盘写满、只读 VFS 挂载、
+  只读 WAL、mmap 关闭、VACUUM progress 保活。
+- 自测新增只读 WAL、mmap=0、VACUUM progress handler 三项，共 26 项。
+
+### 修复
+
+- 只读连接打开活动 WAL 数据库时，若同进程已有写连接，
+  `xShmMap()` 直接附着到已有 WAL shm，不再误返回 `SQLITE_READONLY_CANTINIT`
+  导致 `disk I/O error`。
+
+### 验证
+
+- ESP-IDF 6.1 / ESP32-C5：`test_apps/stress` 全部 PASS：8 次掉电复位、
+  磁盘写满、只读挂载读写拒绝、只读 WAL、mmap=0、VACUUM progress。
+- ESP-IDF 6.1 / ESP32-C5：FULL/MINIMAL/STANDARD/MAX/CRUD 全部
+  `SELFTEST RESULT: PASS`（每次擦除 flash）。
+- ESP-IDF 5.5.4 / ESP32-C5：FULL `SELFTEST RESULT: PASS`；压力工程构建通过。
+
 ## 0.3.1
 
 ### 修复

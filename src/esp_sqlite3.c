@@ -39,6 +39,10 @@ struct esp_sqlite3 {
     sqlite3 *db;        /**< 底层连接 */
     char *path;         /**< 打开路径副本 */
     bool read_only;     /**< 是否只读打开 */
+    esp_sqlite3_progress_cb_t progress_cb; /**< 业务 progress 回调 */
+    void *progress_ctx;                   /**< 业务 progress 上下文 */
+    int progress_n_ops;                   /**< 业务 progress 步长 */
+    uint32_t progress_yield_count;        /**< 内部让出 CPU 计数器 */
 };
 
 typedef enum {
@@ -1215,19 +1219,25 @@ static inline void esp_sqlite3_wdt_feed(void)
     }
 }
 
-/** VACUUM 等长操作的进度回调：喂任务看门狗并周期性让出 CPU */
+/**
+ * progress trampoline：先调用业务回调，再喂狗并周期性让出 CPU。
+ * 业务回调返回非 0 时中止当前 SQL。
+ */
 #ifndef SQLITE_OMIT_PROGRESS_CALLBACK
-static int esp_sqlite3_long_op_progress(void *arg)
+static int esp_sqlite3_progress_trampoline(void *arg)
 {
-    uint32_t *count = (uint32_t *)arg;
-    if (count != NULL) {
-        (*count)++;
-        if ((*count & 0x3F) == 0) {
+    esp_sqlite3_t *db = (esp_sqlite3_t *)arg;
+    int rc = 0;
+    if (db != NULL && db->progress_cb != NULL) {
+        rc = db->progress_cb(db->progress_ctx);
+    }
+    if (rc == 0) {
+        esp_sqlite3_wdt_feed();
+        if (db != NULL && (++db->progress_yield_count & 0x3F) == 0) {
             vTaskDelay(1);
         }
     }
-    esp_sqlite3_wdt_feed();
-    return 0;
+    return rc;
 }
 #endif
 
@@ -1235,14 +1245,47 @@ static esp_err_t esp_sqlite3_exec_long(esp_sqlite3_t *db, const char *sql)
 {
 #ifndef SQLITE_OMIT_PROGRESS_CALLBACK
     if (db != NULL && db->db != NULL) {
-        uint32_t progress = 0;
-        sqlite3_progress_handler(db->db, 1000, esp_sqlite3_long_op_progress, &progress);
+        int n_ops = (db->progress_n_ops > 0) ? db->progress_n_ops : 1000;
+        sqlite3_progress_handler(db->db, n_ops, esp_sqlite3_progress_trampoline, db);
         esp_err_t err = esp_sqlite3_exec(db, sql);
-        sqlite3_progress_handler(db->db, 0, NULL, NULL);
+        /* 恢复业务 handler，而不是无条件清空 */
+        if (db->progress_n_ops > 0 && db->progress_cb != NULL) {
+            sqlite3_progress_handler(db->db, db->progress_n_ops,
+                                     esp_sqlite3_progress_trampoline, db);
+        } else {
+            sqlite3_progress_handler(db->db, 0, NULL, NULL);
+        }
         return err;
     }
 #endif
     return esp_sqlite3_exec(db, sql);
+}
+
+esp_err_t esp_sqlite3_set_progress_handler(esp_sqlite3_t *db, int n_ops,
+                                           esp_sqlite3_progress_cb_t cb, void *ctx)
+{
+    if (db == NULL || db->db == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+#ifdef SQLITE_OMIT_PROGRESS_CALLBACK
+    (void)n_ops;
+    (void)cb;
+    (void)ctx;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    if (n_ops <= 0 || cb == NULL) {
+        db->progress_cb = NULL;
+        db->progress_ctx = NULL;
+        db->progress_n_ops = 0;
+        sqlite3_progress_handler(db->db, 0, NULL, NULL);
+    } else {
+        db->progress_cb = cb;
+        db->progress_ctx = ctx;
+        db->progress_n_ops = n_ops;
+        sqlite3_progress_handler(db->db, n_ops, esp_sqlite3_progress_trampoline, db);
+    }
+    return ESP_OK;
+#endif
 }
 
 esp_err_t esp_sqlite3_vacuum(esp_sqlite3_t *db)
